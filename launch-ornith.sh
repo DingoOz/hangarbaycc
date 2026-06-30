@@ -12,12 +12,23 @@
 #
 set -euo pipefail
 
-MODEL="ornith:latest"
 HOST="127.0.0.1:11434"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDIT_RULES="$SCRIPT_DIR/ornith-editing-rules.md"
 
 # --- interactive selection -----------------------------------------------------
+echo "Select model:"
+echo "  1) ornith:latest        [system store: /var/lib/ollama/models]"
+echo "  2) qwen3-coder:30b       [default store]"
+read -rp "Model [1-2]: " MODEL_CHOICE
+# MODEL_STORE: leave empty to use the default OLLAMA_MODELS location.
+MODEL_STORE=""
+case "$MODEL_CHOICE" in
+  1) MODEL="ornith:latest"; MODEL_STORE=/var/lib/ollama/models ;;  # ornith lives in the system store
+  2) MODEL="qwen3-coder:30b" ;;
+  *) echo "!! Invalid model choice: $MODEL_CHOICE" >&2; exit 1 ;;
+esac
+
 echo "Select context window:"
 echo "  1) 32K   (32768)"
 echo "  2) 64K   (65536)    [known good on 16 GB]"
@@ -49,7 +60,10 @@ export OLLAMA_FLASH_ATTENTION=1
 export OLLAMA_KV_CACHE_TYPE="$KV_CACHE_TYPE"
 export OLLAMA_CONTEXT_LENGTH="$NUM_CTX"
 export OLLAMA_HOST="$HOST"
-export OLLAMA_MODELS=/var/lib/ollama/models   # ornith lives in the system store
+# Only pin OLLAMA_MODELS when the chosen model lives outside the default store.
+if [[ -n "$MODEL_STORE" ]]; then
+  export OLLAMA_MODELS="$MODEL_STORE"
+fi
 
 echo ">> Model: $MODEL | Context: $NUM_CTX | KV cache: $KV_CACHE_TYPE"
 
