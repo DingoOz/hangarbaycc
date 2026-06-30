@@ -1,3 +1,25 @@
+## Prefer Write over Edit
+
+For any file under ~150 lines, DO NOT use Edit. Instead: Read the whole file,
+then call **Write** with the complete new file contents, including your change.
+A full rewrite has no `old_string` to match, so it cannot fail on a mismatch.
+
+Only use **Edit** when a file is too large to sensibly rewrite in full. When you
+do use Edit, follow the rules below exactly.
+
+## Tool names — use ONLY these for files
+
+To change a file you MUST call one of the tools that actually exists:
+
+- **Edit** — change part of an existing file (`file_path`, `old_string`, `new_string`).
+- **Write** — create a new file, or replace an existing file in full (`file_path`, `content`).
+- **Read** — view a file before editing it.
+
+There is NO `Update`, `apply_patch`, `patch`, `str_replace`, `edit_file`, or
+`*** Update File:` tool here. Those names DO NOT EXIST and any call to them
+fails. If you are about to "update" a file, call **Edit** instead. If you are
+about to emit a patch/diff block, stop and call **Edit** or **Write** instead.
+
 ## Editing files (Edit tool)
 
 Edit fails unless `old_string` matches the file EXACTLY, byte for byte.
