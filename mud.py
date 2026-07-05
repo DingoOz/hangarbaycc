@@ -169,7 +169,8 @@ def drop_item(item_name):
     idx = player.inventory.index(item_name)
     del player.inventory[idx]
     room = ROOMS[player.location]
-    room.setdefault("items", []).append(item_name)
+    if item_name not in room.get("items", []):
+        room.setdefault("items", []).append(item_name)
     print(f"You dropped the {ITEMS[item_name]['name']}.")
     return True
 
@@ -224,11 +225,11 @@ def find_enemy(location):
         return None, None
     room = ROOMS.get(location, {})
     for name, info in ENEMIES.items():
-        # Goblin appears randomly; guardian always blocks the treasure_room exit
-        if name == "goblin" and random.random() < 0.5:
+        # Guardian always blocks the treasure_room exit; goblin appears randomly
+        if name == "guardian":
             return name, info
-        elif name == "guardian":
-            pass
+        elif name == "goblin" and random.random() < 0.3:
+            return name, info
     return None, None
 
 
@@ -254,7 +255,7 @@ def fight(enemy_name, enemy_info):
 
                 if enemy_info["hp"] <= 0:
                     print(f"\nYou defeated the {enemy_name}!")
-                    break
+                    return True
                 elif player.hp <= 0:
                     print("\nYou have been killed...")
                     return False
@@ -349,6 +350,9 @@ def main():
         result = False
         if action == "go" and arg is None:
             print("Go where? Specify a direction, e.g. 'go north'.")
+            continue
+        elif (action == "take" or action == "drop") and arg is None:
+            print(f"'{action}' requires an argument. Type 'help' for a list of commands.")
             continue
         elif action in no_arg_cmds or arg is None:
             handler()

@@ -38,10 +38,26 @@ EDIT_RULES="$SCRIPT_DIR/ornith-editing-rules.md"
 TEMP_PROXY="$SCRIPT_DIR/ornith-temp-proxy.py"
 
 # A 9B-class model emits malformed/hallucinated tool calls when too many tools
-# are in context. Disallow the ones a local model rarely uses well: subagents
-# (Task/Agent), web tools, and notebook editing. They never load, so they can't
-# be picked wrongly. Tune this list freely — fewer tools = fewer bad calls.
+# are in context. We auto-DENY the ones a local model rarely uses well: subagents
+# (Agent), web tools, notebook editing.
+#
+# IMPORTANT: --disallowedTools does NOT remove a tool from the schema the model
+# sees — it only auto-denies the call at execution time. The model still sees
+# Agent/Workflow/etc and will still TRY to call them; Claude Code just refuses to
+# run them. (Verified: the tool list is byte-identical with and without the flag.)
+# There is no flag/env that hides these tools from a local model, so the real fix
+# for the "There's an issue with the selected model" spam is SUBAGENT_MODEL below.
+# 'Task' is kept here only for older builds; the live subagent tool is 'Agent'.
 DISALLOWED_TOOLS=(Task Agent Workflow WebFetch WebSearch NotebookEdit)
+
+# `ollama launch claude` sets CLAUDE_CODE_SUBAGENT_MODEL to EMPTY. Claude's logic
+# is: if the var is set and != "inherit", use it; otherwise fall back to a default
+# 'sonnet' alias — which this local Ollama cannot serve, so every spawned agent
+# panel errors with "There's an issue with the selected model". Forcing "inherit"
+# makes any subagent reuse the running local model instead, so a stray Agent call
+# is harmless rather than an error. Passed via --settings (scoped to THIS launch
+# only; your normal cloud Claude is untouched). settings.env beats process env.
+SUBAGENT_SETTINGS='{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"inherit"}}'
 
 # --- interactive selection -----------------------------------------------------
 echo "Select model:   (all fit any ctx/KV on 16 GB; see fit table in header)"
@@ -176,11 +192,13 @@ if [[ -f "$EDIT_RULES" ]]; then
   # Args after `--` are forwarded to Claude Code itself (ollama launch passes
   # them through). The flags are NOT `ollama launch` flags, so they go here.
   exec ollama launch claude --model "$MODEL" -y -- \
+    --settings "$SUBAGENT_SETTINGS" \
     --append-system-prompt "$(cat "$EDIT_RULES")" \
     --disallowedTools "${DISALLOWED_TOOLS[@]}"
 else
   echo "!! $EDIT_RULES not found — launching without the editing-rules prompt." >&2
   echo ">> Disallowing tools: ${DISALLOWED_TOOLS[*]}"
   exec ollama launch claude --model "$MODEL" -y -- \
+    --settings "$SUBAGENT_SETTINGS" \
     --disallowedTools "${DISALLOWED_TOOLS[@]}"
 fi

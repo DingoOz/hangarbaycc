@@ -1,3 +1,10 @@
+## Do all work yourself — never spawn subagents
+
+Do NOT call the **Agent**, **Task**, or **Workflow** tools, and do not use
+**WebFetch** or **WebSearch**. There are no working subagents in this setup:
+every spawn fails with "There's an issue with the selected model". Perform every
+step directly in this conversation using Read / Edit / Write / Bash yourself.
+
 ## Prefer Write over Edit
 
 For any file under ~150 lines, DO NOT use Edit. Instead: Read the whole file,
