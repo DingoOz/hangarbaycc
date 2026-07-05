@@ -35,6 +35,20 @@ Look for:
 
 ## 3. Proxy log — /tmp/ornith-temp-proxy.log
 
+Every generation gets a summary line:
+`POST /v1/messages -> 200 5.3s req=41200B resp=8100B stop=tool_use`.
+
+- `<-- EMPTY RESPONSE` markers → the model produced no content block; a burst
+  of these right before a session died is the smoking gun (correlate with the
+  temp band and the last tool results in the conversation).
+- `stop=max_tokens` on real requests → responses being truncated.
+- Known failure mode (2026-07-05): Ollama 404s `/v1/messages/count_tokens`;
+  Claude Code then falls back to probing with max_tokens=1 requests (shows up
+  server-side as bursts of 1-token evals) and that path can kill the session
+  with "There's an issue with the selected model". The proxy now serves
+  count_tokens locally — if you see count_tokens 404s in the OLLAMA log, the
+  traffic is bypassing the proxy.
+
 - The startup line shows the active band / top_p cap / strip list — confirm
   they match the model that was run (gpt-oss should be 0.9–1.0, others
   0.55–0.70).

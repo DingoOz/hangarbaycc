@@ -22,12 +22,23 @@ sees the schema and still tries. Removing the entry here means the model never
 sees the tool at all: no hallucinated calls, and several thousand tokens of
 schema freed for actual code context.
 
+We implement POST /v1/messages/count_tokens LOCALLY (chars/4 estimate).
+Ollama doesn't serve that route (404), and Claude Code's fallback — probing
+with max_tokens=1 requests and reconciling the numbers — has been observed to
+fall over and kill the session with "There's an issue with the selected
+model". An estimate keeps Claude Code's context accounting on the happy path;
+it only drives compaction heuristics, so precision doesn't matter.
+
 We also inject `repeat_penalty` / `repeat_last_n` to suppress the *within-a-single-
 generation* runaway (e.g. the same method emitted over and over). These are Ollama
 sampling options; if the upstream Anthropic-compat adapter doesn't forward them to
 the model they are simply ignored — harmless either way. Note they do NOT help the
 across-turn agentic loop (penalties only apply within one decode); the temperature
 band is the lever for that.
+
+Each /v1/messages generation is summarised to stderr (status, seconds, bytes,
+stop_reason, whether any content block was produced) so a dead session can be
+diagnosed from /tmp/ornith-temp-proxy.log after the fact.
 
 Everything else is forwarded verbatim to UPSTREAM. All other routes
 (/api/version, /api/tags, model preload, ...) pass straight through, so
@@ -40,7 +51,9 @@ Defaults: 11435  127.0.0.1:11434  0.55  0.70  0.95  ""
 """
 import http.client
 import json
+import re
 import sys
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 11435
@@ -59,6 +72,10 @@ HOP_BY_HOP = {
 }
 
 _last_strip_count = None  # log only when the stripped count changes
+
+
+def log(msg: str) -> None:
+    sys.stderr.write(time.strftime("[proxy %H:%M:%S] ") + msg + "\n")
 
 
 def rewrite_body(body: bytes) -> bytes:
@@ -86,8 +103,7 @@ def rewrite_body(body: bytes) -> bytes:
             changed = True
         if stripped != _last_strip_count:
             _last_strip_count = stripped
-            sys.stderr.write(f"[proxy] stripped {stripped} tool schema(s), "
-                             f"{len(kept)} remain\n")
+            log(f"stripped {stripped} tool schema(s), {len(kept)} remain")
 
     # Clamp temperature into [TEMP_FLOOR, TEMP_CEIL]. Default it to the floor
     # when absent so a request with no temperature still gets some entropy.
@@ -119,19 +135,48 @@ def rewrite_body(body: bytes) -> bytes:
 class Proxy(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def _send_json(self, obj: dict) -> None:
+        payload = json.dumps(obj).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _count_tokens(self, body: bytes) -> None:
+        """Serve /v1/messages/count_tokens locally: Ollama 404s it, and Claude
+        Code's fallback probing can kill the session. A rough estimate is all
+        the context accounting needs."""
+        try:
+            data = json.loads(body) if body else {}
+        except (ValueError, UnicodeDecodeError):
+            data = {}
+        text = json.dumps([data.get(k) for k in ("system", "messages", "tools")])
+        self._send_json({"input_tokens": max(1, len(text) // 4)})
+
     def _relay(self):
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b""
         body = rewrite_body(body)
+
+        if self.command == "POST" and self.path.startswith("/v1/messages/count_tokens"):
+            return self._count_tokens(body)
+        is_gen = self.command == "POST" and self.path.startswith("/v1/messages")
 
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in HOP_BY_HOP}
         headers["Content-Length"] = str(len(body))
 
         conn = http.client.HTTPConnection(UPSTREAM, timeout=600)
+        t0 = time.time()
+        total, carry = 0, b""
+        saw_content = False
+        stop_reason = None
+        status = None
         try:
             conn.request(self.command, self.path, body=body, headers=headers)
             resp = conn.getresponse()
+            status = resp.status
 
             self.send_response(resp.status)
             for k, v in resp.getheaders():
@@ -144,12 +189,26 @@ class Proxy(BaseHTTPRequestHandler):
                 chunk = resp.read(4096)
                 if not chunk:
                     break
+                total += len(chunk)
+                if is_gen:
+                    window = carry + chunk
+                    if not saw_content and b"content_block_start" in window:
+                        saw_content = True
+                    m = re.search(rb'\\?"stop_reason\\?"\s*:\s*\\?"(\w+)', window)
+                    if m:
+                        stop_reason = m.group(1).decode()
+                    carry = window[-64:]
                 self.wfile.write(b"%X\r\n%s\r\n" % (len(chunk), chunk))
                 self.wfile.flush()
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
+            if is_gen:
+                note = "" if saw_content else "  <-- EMPTY RESPONSE (no content block)"
+                log(f"POST {self.path} -> {status} {time.time() - t0:.1f}s "
+                    f"req={length}B resp={total}B stop={stop_reason}{note}")
         except Exception as exc:  # upstream died mid-stream; best-effort close
-            sys.stderr.write(f"[proxy] relay error: {exc}\n")
+            log(f"relay error on {self.command} {self.path} "
+                f"(status={status}, {total}B relayed): {exc}")
         finally:
             conn.close()
 
@@ -159,9 +218,20 @@ class Proxy(BaseHTTPRequestHandler):
         pass
 
 
+class QuietServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # Clients (Claude Code's connection pool) reset idle keep-alive
+        # connections constantly; that's normal, not worth a traceback.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 if __name__ == "__main__":
     print(f">> ornith-temp-proxy: :{LISTEN_PORT} -> {UPSTREAM} "
           f"(temperature -> [{TEMP_FLOOR}, {TEMP_CEIL}], top_p <= {TOP_P_CEIL}, "
           f"repeat_penalty -> {REPEAT_PENALTY}, "
-          f"strip_tools = {sorted(STRIP_TOOLS) or 'none'})", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", LISTEN_PORT), Proxy).serve_forever()
+          f"strip_tools = {sorted(STRIP_TOOLS) or 'none'}, "
+          f"count_tokens served locally)", flush=True)
+    QuietServer(("127.0.0.1", LISTEN_PORT), Proxy).serve_forever()

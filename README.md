@@ -55,6 +55,12 @@ A transparent reverse proxy between Claude Code and Ollama that rewrites every
   `--disallowedTools` stays on as a backstop.
 - **Anti-repetition.** Injects `repeat_penalty`/`repeat_last_n` to suppress
   within-one-reply runaways, and caps `top_p`.
+- **count_tokens shim.** Ollama 404s `/v1/messages/count_tokens`, and Claude
+  Code's fallback (max_tokens=1 probe requests) can error the whole session
+  ("There's an issue with the selected model"). The proxy answers the route
+  locally with a chars/4 estimate.
+- **Diagnostics.** One summary line per generation (status, time, bytes,
+  stop_reason, empty-response marker) in `/tmp/ornith-temp-proxy.log`.
 
 The launcher also forces `CLAUDE_CODE_SUBAGENT_MODEL=inherit` (via
 `--settings`, scoped to the launched session) so a stray subagent spawn reuses
