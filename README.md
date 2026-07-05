@@ -99,8 +99,50 @@ diagnoses a bad session from the logs.
 Afterwards, `sudo systemctl start ollama` restores the system Ollama service
 if you want it back.
 
+## Remote operation
+
+Run the launcher from a laptop while the model runs on a GPU box elsewhere on
+the LAN (e.g. `ml-server`):
+
+```bash
+./hangarbaycc.sh --remote ml-server
+# or: HANGARBAY_REMOTE=ml-server ./hangarbaycc.sh
+```
+
+The **Ollama server runs on the remote host** over SSH; the **proxy and Claude
+Code stay on the laptop**, talking to the remote Ollama directly over the LAN
+(`hangarbaycc-proxy.py`'s upstream just becomes `ml-server:11434` instead of
+`127.0.0.1:11434` — the proxy code itself didn't need to change). Model
+selection, context/KV prompts, the GPU-spill guard, and the editing rules all
+work exactly as in local mode; only the server start/stop and the model-store
+lookup happen over SSH.
+
+**Prerequisites:**
+- Laptop: this repo, the `ollama` CLI (client only — it doesn't need to run a
+  local server), `claude`, `python3`, and SSH access to the remote host.
+  Key-based auth is strongly preferred (`ssh-copy-id ml-server`) — a launch
+  makes several separate SSH calls, which is painful to re-authenticate for
+  each one with a password.
+- Remote host: `ollama`, the models, an NVIDIA GPU, and (if the systemd
+  `ollama` service is normally active) sudo access to stop/start it.
+
+**Security note:** while a remote session runs, the remote host's Ollama binds
+`0.0.0.0:11434` — reachable by *anything* on that LAN, not just your laptop.
+Fine on a trusted home network; don't do this on a network you don't trust.
+For access from outside the LAN, point `--remote` at a Tailscale IP instead of
+the LAN hostname/IP — same mechanism, narrower reachability (only your
+tailnet, instead of the whole LAN).
+
+**Troubleshooting:** if the launcher times out waiting for the remote server,
+check the remote host's firewall allows port 11434 from your subnet, and tail
+`/tmp/ollama-hangarbaycc.log` there (`ssh ml-server tail -50
+/tmp/ollama-hangarbaycc.log`). See `.claude/skills/hangarbaycc-doctor/` for a
+fuller checklist — it covers remote-mode log locations too.
+
 ## Requirements
 
 - `ollama` ≥ 0.30 (with `ollama launch claude` integration)
-- `nvidia-smi` / an NVIDIA GPU (tables measured on an RTX 5060 Ti 16 GB)
+- `nvidia-smi` / an NVIDIA GPU on whichever machine hosts the model (tables
+  measured on an RTX 5060 Ti 16 GB)
 - Claude Code, `python3`, `gcc`/`g++` (for the bench checks)
+- For `--remote`: SSH access (ideally key-based) to the remote host

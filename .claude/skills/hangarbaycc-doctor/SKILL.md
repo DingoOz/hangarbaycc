@@ -8,20 +8,36 @@ description: Diagnose a local-model Claude Code session after the fact — inspe
 Post-session diagnosis for the HangarBayCC stack. Work through this
 checklist and report findings with a concrete recommendation for each.
 
+## 0. Local or `--remote`?
+
+If `hangarbaycc.sh` was launched with `--remote HOST`, the Ollama server
+lives on HOST (SSH-managed) while the proxy and Claude Code run on the
+machine you're diagnosing from. Everything below still applies — just run
+the "server" checks (§1's `ollama`/GPU/`/tmp/ollama-hangarbaycc.log` bits) via
+`ssh HOST ...` instead of directly, and note that `curl`/`ollama ps` from the
+client naturally reach the remote server already (`OLLAMA_HOST` points at it).
+The proxy and its log are always local, remote mode or not.
+
 ## 1. Is anything still running, and where?
 
 ```bash
-pgrep -ax ollama; pgrep -af hangarbaycc-proxy
-curl -sf http://127.0.0.1:11434/api/version && curl -s http://127.0.0.1:11434/api/ps
-nvidia-smi --query-gpu=memory.total,memory.used --format=csv
+# server-side (prefix with `ssh HOST` in --remote mode)
+pgrep -ax ollama
+curl -sf http://<API_HOST>/api/version && curl -s http://<API_HOST>/api/ps
+nvidia-smi --query-gpu=memory.total,memory.used --format=csv   # on whichever host has the GPU
+
+# client-side (always local, both modes)
+pgrep -af hangarbaycc-proxy
 ```
 
-In `/api/ps`, `size_vram < size` means CPU spill → recommend a smaller
+`<API_HOST>` is `127.0.0.1:11434` in local mode, `HOST:11434` in `--remote`
+mode. In `/api/ps`, `size_vram < size` means CPU spill → recommend a smaller
 context or more compressed KV cache (see the fit table in `hangarbaycc.sh`).
 
 ## 2. Server log — /tmp/ollama-hangarbaycc.log
 
-Look for:
+In `--remote` mode this file is on the remote host: `ssh HOST tail -50
+/tmp/ollama-hangarbaycc.log`. Look for:
 - `offloaded X/Y layers to GPU` with X < Y → spill (same fix as above).
 - repeated `loading model` / memory-layout lines mid-session → the model was
   unloaded and reloaded (each reload re-prefills the whole conversation).

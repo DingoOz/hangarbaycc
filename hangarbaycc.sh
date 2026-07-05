@@ -3,8 +3,26 @@
 # hangarbaycc.sh — HangarBayCC: launch Claude Code wired to a local Ollama
 #                   model, with a chosen KV cache precision and context window.
 #
-# VERIFIED FIT TABLE — measured on this RTX 5060 Ti (16 GB) via the preload
+# Usage:
+#   ./hangarbaycc.sh                  run everything on this machine (default)
+#   ./hangarbaycc.sh --remote HOST    run the Ollama server on HOST over SSH;
+#                                     the proxy and Claude Code stay on THIS
+#                                     machine, wired to HOST's Ollama over the
+#                                     LAN. HOST is anything `ssh HOST` accepts
+#                                     (hostname, IP, or ssh-config alias).
+#   HANGARBAY_REMOTE=HOST ./hangarbaycc.sh   same, via env var instead of a flag.
+#
+# Remote mode requires: `ssh HOST` already works (key-based auth strongly
+# preferred — several separate ssh calls happen per launch); HOST has the GPU,
+# ollama, and the model store; HOST's Ollama binds 0.0.0.0:11434, so it is
+# reachable by anything on the LAN for as long as the session runs — fine on a
+# trusted home LAN, not something to expose beyond it. If HOST's firewall
+# blocks port 11434 from your subnet, the server-wait step below will time out
+# with a hint.
+#
+# VERIFIED FIT TABLE — measured on an RTX 5060 Ti (16 GB) via the preload
 # guard (/api/ps size_vram vs size). Numbers are total reported VRAM use.
+# Applies to whichever machine actually hosts the GPU (local or --remote).
 #
 #   ornith:latest (~5.6 GB weights) — FITS EVERYTHING, 100% GPU:
 #     ctx     q4_0     q8_0     f16
@@ -34,8 +52,88 @@
 #
 set -euo pipefail
 
-HOST="127.0.0.1:11434"
-PROXY_HOST="127.0.0.1:11435"   # temperature-clamping proxy in front of HOST
+usage() {
+  cat <<'USAGE'
+Usage: hangarbaycc.sh [-r|--remote HOST]
+
+  -r, --remote HOST   Run the Ollama server on HOST over SSH instead of this
+                       machine. The proxy and Claude Code still run here.
+  -h, --help           Show this help.
+
+HOST may also come from the HANGARBAY_REMOTE environment variable; the flag
+takes precedence if both are given.
+USAGE
+}
+
+REMOTE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--remote) REMOTE="${2:?--remote requires a HOST argument}"; shift 2 ;;
+    --remote=*)  REMOTE="${1#*=}"; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "!! Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+REMOTE="${REMOTE:-${HANGARBAY_REMOTE:-}}"
+SERVER_LABEL="${REMOTE:-local}"
+
+# --- helpers for running a command on the target host (local or --remote) -----
+# Simple one-shot command, no pty (fine for anything that doesn't need a
+# terminal, e.g. a health check).
+remote_exec() {
+  if [[ -n "$REMOTE" ]]; then ssh "$REMOTE" "$1"; else bash -c "$1"; fi
+}
+# Same, but allocates a pty — needed for an interactive sudo password prompt.
+remote_exec_tty() {
+  if [[ -n "$REMOTE" ]]; then ssh -t "$REMOTE" "$1"; else bash -c "$1"; fi
+}
+# Multi-line script fed over stdin instead of as a quoted argument — avoids
+# quoting hell when a script mixes values already known here (interpolated
+# before sending) with variables meant to be evaluated on the target host
+# (escaped as \$foo so they survive to the far end literally).
+remote_script() {
+  if [[ -n "$REMOTE" ]]; then ssh "$REMOTE" bash -s; else bash -s; fi
+}
+
+# Poll a /api/version endpoint until it answers or we give up, instead of
+# looping forever (a blocked port or a server that never starts would
+# otherwise hang the launcher indefinitely).
+wait_for_http() {
+  local host="$1" hint="${2:-}" tries=60
+  until curl -sf "http://${host}/api/version" >/dev/null 2>&1; do
+    tries=$((tries - 1))
+    if [[ $tries -le 0 ]]; then
+      echo "!! Timed out waiting for ${host} to answer." >&2
+      [[ -n "$hint" ]] && echo "!! $hint" >&2
+      exit 1
+    fi
+    sleep 0.5
+  done
+}
+
+if [[ -n "$REMOTE" ]]; then
+  echo ">> Remote mode: Ollama server on '$REMOTE'; proxy + Claude Code stay here."
+  if ! ssh -o ConnectTimeout=5 "$REMOTE" true; then
+    echo "!! Could not reach '$REMOTE' over SSH." >&2
+    echo "!! Check the host is up, 'ssh $REMOTE' works by hand, and (ideally)" >&2
+    echo "!! key-based auth is set up (ssh-copy-id $REMOTE) — several separate" >&2
+    echo "!! ssh calls happen per launch, which is painful with password auth." >&2
+    exit 1
+  fi
+fi
+
+# SERVER_BIND is what Ollama binds on the server; API_HOST is where the client
+# (this machine) reaches it. Same address in local mode; in remote mode the
+# server binds every interface (0.0.0.0) so the LAN can reach it, and the
+# client talks to it at $REMOTE's address.
+if [[ -n "$REMOTE" ]]; then
+  SERVER_BIND="0.0.0.0:11434"
+  API_HOST="${REMOTE}:11434"
+else
+  SERVER_BIND="127.0.0.1:11434"
+  API_HOST="127.0.0.1:11434"
+fi
+PROXY_HOST="127.0.0.1:11435"   # temperature-clamping proxy; always local
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDIT_RULES="$SCRIPT_DIR/hangarbaycc-editing-rules.md"
 TEMP_PROXY="$SCRIPT_DIR/hangarbaycc-proxy.py"
@@ -79,16 +177,19 @@ case "$MODEL_CHOICE" in
   *) echo "!! Invalid model choice: $MODEL_CHOICE" >&2; exit 1 ;;
 esac
 
-# Models live in either the system store or the user store; Ollama can only use
-# one at a time, so point OLLAMA_MODELS at whichever store has the chosen model.
-MODEL_STORE=""
-for store in /var/lib/ollama/models "$HOME/.ollama/models"; do
-  manifest="$store/manifests/registry.ollama.ai/library/${MODEL%%:*}/${MODEL##*:}"
-  if [[ -f "$manifest" ]]; then MODEL_STORE="$store"; break; fi
+# Models live in either the system store or the user store on the TARGET host;
+# Ollama can only use one at a time, so point OLLAMA_MODELS at whichever store
+# has the chosen model there.
+MODEL_STORE="$(remote_script <<EOF
+for store in /var/lib/ollama/models "\$HOME/.ollama/models"; do
+  manifest="\$store/manifests/registry.ollama.ai/library/${MODEL%%:*}/${MODEL##*:}"
+  if [[ -f "\$manifest" ]]; then echo "\$store"; break; fi
 done
+EOF
+)"
 if [[ -z "$MODEL_STORE" ]]; then
-  echo "!! Model '$MODEL' not found in /var/lib/ollama/models or ~/.ollama/models." >&2
-  echo "!! Pull it first ('ollama pull $MODEL') — or, if a pull is in progress," >&2
+  echo "!! Model '$MODEL' not found in /var/lib/ollama/models or ~/.ollama/models on ${SERVER_LABEL}." >&2
+  echo "!! Pull it there first ('ollama pull $MODEL') — or, if a pull is in progress," >&2
   echo "!! wait for it to finish (manifests only appear when the download completes)." >&2
   exit 1
 fi
@@ -134,54 +235,51 @@ if [[ "$MODEL" == "qwen2.5-coder:14b" && "$KV_CACHE_TYPE" == "f16" ]]; then
   echo ">>          (near-lossless) if you see garbled or repetitive output." >&2
 fi
 
-# Settings below must reach the SERVER process, not the client.
-export OLLAMA_FLASH_ATTENTION=1
-export OLLAMA_KV_CACHE_TYPE="$KV_CACHE_TYPE"
-export OLLAMA_CONTEXT_LENGTH="$NUM_CTX"
-export OLLAMA_HOST="$HOST"
-export OLLAMA_MODELS="$MODEL_STORE"
-# Never unload on idle: an unload mid-session forces a full re-prefill of the
-# whole conversation on the next request (minutes at 100K+ tokens of context).
-export OLLAMA_KEEP_ALIVE=-1
-# One request stream (Claude Code) gets the whole context window, regardless of
-# what this Ollama version's parallel-request default happens to be.
-export OLLAMA_NUM_PARALLEL=1
+# Client-side: only OLLAMA_HOST matters in this shell (ollama ps/stop below,
+# and later `ollama launch claude` once repointed at the proxy). The rest are
+# server-only knobs, passed inline to the (possibly remote) `ollama serve`
+# invocation in step 2 instead of exported here.
+export OLLAMA_HOST="$API_HOST"
 
-echo ">> Model: $MODEL (store: $MODEL_STORE)"
+echo ">> Model: $MODEL (store: $MODEL_STORE on ${SERVER_LABEL})"
 echo ">> Context: $NUM_CTX | KV cache: $KV_CACHE_TYPE | temp band: [$TEMP_FLOOR, $TEMP_CEIL]"
 
 # --- 0. GPU must be healthy before we do anything -----------------------------
-if ! nvidia-smi >/dev/null 2>&1; then
-  echo "!! GPU unavailable (nvidia-smi failed). Reboot / reset the driver first." >&2
+if ! remote_exec "nvidia-smi >/dev/null 2>&1"; then
+  echo "!! GPU unavailable on ${SERVER_LABEL} (nvidia-smi failed)." >&2
+  echo "!! Reboot / reset the driver there first." >&2
   exit 1
 fi
 
 # --- 1. stop any running server (exact name; never pkill -f, it self-matches) -
-if systemctl is-active --quiet ollama 2>/dev/null; then sudo systemctl stop ollama; fi
+echo ">> Stopping any existing server on ${SERVER_LABEL}..."
+remote_exec_tty 'if systemctl is-active --quiet ollama 2>/dev/null; then sudo systemctl stop ollama; fi'
+pkill -f "$TEMP_PROXY" 2>/dev/null || true   # stale temperature proxy from a prior run (always local)
+
+# --- 2. start the server with the settings above ------------------------------
+echo ">> Starting ollama serve on ${SERVER_LABEL}..."
+remote_script <<EOF
 pkill -x ollama 2>/dev/null || true
 pkill -x llama-server 2>/dev/null || true
-pkill -f "$TEMP_PROXY" 2>/dev/null || true   # stale temperature proxy from a prior run
 sleep 2
-
-# --- 2. start our server with the settings above ------------------------------
-echo ">> Starting ollama serve..."
-nohup ollama serve >/tmp/ollama-hangarbaycc.log 2>&1 &
+OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=$KV_CACHE_TYPE OLLAMA_CONTEXT_LENGTH=$NUM_CTX OLLAMA_HOST=$SERVER_BIND OLLAMA_MODELS=$MODEL_STORE OLLAMA_KEEP_ALIVE=-1 OLLAMA_NUM_PARALLEL=1 setsid nohup ollama serve >/tmp/ollama-hangarbaycc.log 2>&1 </dev/null &
 disown
-until curl -sf "http://${HOST}/api/version" >/dev/null 2>&1; do sleep 0.5; done
+EOF
+wait_for_http "$API_HOST" "${REMOTE:+Check the firewall on $REMOTE allows port 11434 from this LAN, and that the server started: ssh $REMOTE tail -20 /tmp/ollama-hangarbaycc.log}"
 
 # --- 3. preload and VERIFY it's fully on the GPU before launching Claude Code --
 echo ">> Preloading (allocates the full KV cache)..."
-if ! curl -sf "http://${HOST}/api/generate" \
+if ! curl -sf "http://${API_HOST}/api/generate" \
   -d "{\"model\":\"${MODEL}\",\"prompt\":\"hi\",\"stream\":false}" >/dev/null; then
   echo "!! Preload failed for model '$MODEL' (server returned an error)." >&2
   echo "!! Most likely the model isn't in the store the server is using." >&2
-  echo "!!   store in use: ${OLLAMA_MODELS}" >&2
-  echo "!! Check 'ollama list', or 'ollama pull $MODEL'. See /tmp/ollama-hangarbaycc.log for details." >&2
+  echo "!!   store in use: ${MODEL_STORE} on ${SERVER_LABEL}" >&2
+  echo "!! Check 'ollama list', or 'ollama pull $MODEL' there. See /tmp/ollama-hangarbaycc.log for details." >&2
   exit 1
 fi
 
 ollama ps
-if ! SPILL="$(curl -sf "http://${HOST}/api/ps" | python3 -c '
+if ! SPILL="$(curl -sf "http://${API_HOST}/api/ps" | python3 -c '
 import json, sys
 for m in json.load(sys.stdin).get("models", []):
     size, vram = m.get("size", 0), m.get("size_vram", 0)
@@ -191,7 +289,7 @@ for m in json.load(sys.stdin).get("models", []):
               % (m.get("name"), (size - vram) / gib, size / gib))
 ')"; then
   echo "!! Could not verify GPU placement (/api/ps check failed)." >&2
-  echo "!! Not launching blind — check /tmp/ollama-hangarbaycc.log and ollama ps." >&2
+  echo "!! Not launching blind — check /tmp/ollama-hangarbaycc.log on ${SERVER_LABEL} and ollama ps." >&2
   exit 1
 fi
 if [[ -n "$SPILL" ]]; then
@@ -206,15 +304,16 @@ echo ">> Fully on GPU. Launching Claude Code..."
 # --- 3b. start the temperature-clamping proxy and point Claude Code at it ------
 # The proxy transparently forwards to the real server but clamps temperature
 # into the model's band, caps top_p, and strips the DISALLOWED_TOOLS schemas
-# out of every request. We only repoint OLLAMA_HOST for the launch step below.
+# out of every request. It always runs on THIS machine, pointed at API_HOST
+# (which may be remote); we only repoint OLLAMA_HOST for the launch step below.
 PROXY_PORT="${PROXY_HOST##*:}"
 STRIP_TOOLS="$(IFS=,; echo "${DISALLOWED_TOOLS[*]}")"
 if [[ -f "$TEMP_PROXY" ]]; then
-  echo ">> Starting temperature proxy (:$PROXY_PORT -> $HOST, temp -> [$TEMP_FLOOR, $TEMP_CEIL], strip: $STRIP_TOOLS)..."
-  nohup python3 "$TEMP_PROXY" "$PROXY_PORT" "$HOST" "$TEMP_FLOOR" "$TEMP_CEIL" \
+  echo ">> Starting temperature proxy (:$PROXY_PORT -> $API_HOST, temp -> [$TEMP_FLOOR, $TEMP_CEIL], strip: $STRIP_TOOLS)..."
+  nohup python3 "$TEMP_PROXY" "$PROXY_PORT" "$API_HOST" "$TEMP_FLOOR" "$TEMP_CEIL" \
     "$TOP_P_CEIL" "$STRIP_TOOLS" >/tmp/hangarbaycc-proxy.log 2>&1 &
   disown
-  until curl -sf "http://${PROXY_HOST}/api/version" >/dev/null 2>&1; do sleep 0.2; done
+  wait_for_http "$PROXY_HOST" "Check /tmp/hangarbaycc-proxy.log"
   export OLLAMA_HOST="$PROXY_HOST"
 else
   echo "!! $TEMP_PROXY not found — launching at the model's default temperature." >&2
@@ -246,5 +345,9 @@ else
     --disallowedTools "${DISALLOWED_TOOLS[@]}"
 fi
 
-echo ">> Session over. Temp proxy stopped; ollama server left running (model stays warm)."
-echo ">> To restore the system Ollama service: sudo systemctl start ollama"
+echo ">> Session over. Temp proxy stopped; ollama server on ${SERVER_LABEL} left running (model stays warm)."
+if [[ -n "$REMOTE" ]]; then
+  echo ">> To restore the system Ollama service on $REMOTE: ssh -t $REMOTE sudo systemctl start ollama"
+else
+  echo ">> To restore the system Ollama service: sudo systemctl start ollama"
+fi
