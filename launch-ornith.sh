@@ -181,15 +181,19 @@ if ! curl -sf "http://${HOST}/api/generate" \
 fi
 
 ollama ps
-SPILL="$(curl -sf "http://${HOST}/api/ps" | python3 -c '
+if ! SPILL="$(curl -sf "http://${HOST}/api/ps" | python3 -c '
 import json, sys
 for m in json.load(sys.stdin).get("models", []):
     size, vram = m.get("size", 0), m.get("size_vram", 0)
     if vram < size:
-        gib = 2**30
-        print(f"{m.get(\"name\")}: {(size - vram) / gib:.1f} GiB on CPU "
-              f"of {size / gib:.1f} GiB total")
-')"
+        gib = 2 ** 30
+        print("%s: %.1f GiB on CPU of %.1f GiB total"
+              % (m.get("name"), (size - vram) / gib, size / gib))
+')"; then
+  echo "!! Could not verify GPU placement (/api/ps check failed)." >&2
+  echo "!! Not launching blind — check /tmp/ollama-ornith.log and ollama ps." >&2
+  exit 1
+fi
 if [[ -n "$SPILL" ]]; then
   echo "!! $NUM_CTX tokens spilled to CPU — too big for 16 GB VRAM:" >&2
   echo "!!   $SPILL" >&2
