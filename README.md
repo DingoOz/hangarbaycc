@@ -33,7 +33,7 @@ produce decent C / C++ / Python code.
 | 1 | `ornith:latest` | 9B, 5.6 GB — fits every ctx/KV combo up to 256K/f16; best agentic behavior |
 | 2 | `gemma4:latest` | 8B Q4_K_M — max 128K context |
 | 3 | `qwen2.5-coder:14b` | strong raw coder, native 32K only; prefer q8_0 KV (fp16 KV can garble) |
-| 4 | `gpt-oss:20b` | 20B MoE, ~13 GB — strongest C/C++/Python + tool calling; max 128K, tight at 128K/f16 |
+| 4 | `gpt-oss:20b` | 20B MoE, ~12 GB — strongest C/C++/Python + tool calling; max 128K; use q8_0 KV (f16 KV spills beyond 32K) |
 
 ## The proxy (ornith-temp-proxy.py)
 
@@ -74,7 +74,11 @@ of thrashing.
 the model (optionally through the proxy to measure a temp band), mechanically
 checks the results (compile, run, exact output), and writes a scorecard to
 `bench/results/`. Use it to compare models and settings with data instead of
-vibes. See `.claude/skills/ornith-bench/` — in a cloud Claude Code session in
+vibes.
+
+Baseline (2026-07-05, raw model sampling, single run each): `gpt-oss:20b`
+**8/8**; `ornith:latest` **4/8** (0/3 on the C tasks). For C/C++ work, pick
+gpt-oss. See `.claude/skills/ornith-bench/` — in a cloud Claude Code session in
 this repo, `/ornith-bench` runs it and `/ornith-doctor` diagnoses a bad
 session from the logs.
 

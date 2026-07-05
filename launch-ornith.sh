@@ -16,9 +16,14 @@
 #   gemma4:latest (8B, Q4_K_M) — FITS EVERYTHING, 100% GPU. Max context is 128K.
 #     Peak ~6.5 GB VRAM at 128K/f16 — comfortable headroom everywhere.
 #
-#   gpt-oss:20b (~13 GB MXFP4 MoE) — fit per ctx/KV NOT YET MEASURED on this
-#     card; the preload guard below verifies on every launch. Expect 32K–64K to
-#     fit and 128K/f16 to be tight. Max context is 128K.
+#   gpt-oss:20b (~12 GB MXFP4 MoE) — max context 128K. Sliding-window attention
+#     keeps KV growth tiny, so context is nearly free — EXCEPT f16 KV, which
+#     spills to CPU beyond 32K:
+#     ctx     q4_0     q8_0     f16
+#     32K     11.9 GB  12.0 GB  11.9 GB
+#     64K     12.2 GB  12.2 GB  13.3 GB (2.0 GB on CPU — DON'T)
+#     128K    12.2 GB  12.2 GB  13.3 GB (2.0 GB on CPU — DON'T)
+#     -> for gpt-oss pick q8_0 KV and any context up to 128K.
 #
 # (qwen3-coder:30b was dropped: ~18 GB weights exceed 16 GB VRAM, so it spills
 #  to CPU at every context/KV setting and runs CPU-bound. Not offered here.)
@@ -61,10 +66,10 @@ SUBAGENT_SETTINGS='{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"inherit"}}'
 # exception: its recommended sampling IS temp 1.0 / top_p 1.0, so its band is
 # 0.9-1.0 and the clamp is effectively a no-op.
 echo "Select model:   (see fit table in header; the preload guard verifies fit)"
-echo "  1) ornith:latest         9B,  5.6 GB weights, full 256K context, best for agents"
+echo "  1) ornith:latest         9B,  5.6 GB weights, full 256K context (bench: 4/8)"
 echo "  2) gemma4:latest         8B Q4_K_M, max 128K context"
 echo "  3) qwen2.5-coder:14b     strong coder, native 32K context (capped at 32K)"
-echo "  4) gpt-oss:20b           20B MoE, ~13 GB, strong C/C++/Python + tools, max 128K"
+echo "  4) gpt-oss:20b           20B MoE, ~12 GB, max 128K, use q8_0 KV (bench: 8/8)"
 read -rp "Model [1-4]: " MODEL_CHOICE
 case "$MODEL_CHOICE" in
   1) MODEL="ornith:latest"     MAX_CTX=262144 TEMP_FLOOR=0.55 TEMP_CEIL=0.70 TOP_P_CEIL=0.95 ;;
