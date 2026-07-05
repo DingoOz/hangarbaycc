@@ -1,25 +1,25 @@
 ---
-name: ornith-doctor
-description: Diagnose a local-model Claude Code session after the fact — inspect the Ollama and temp-proxy logs, VRAM/spill state, unload events, and malformed tool calls, then recommend setting changes. Use when a launch-ornith session was slow, looped, garbled, or errored.
+name: hangarbaycc-doctor
+description: Diagnose a local-model Claude Code session after the fact — inspect the Ollama and temp-proxy logs, VRAM/spill state, unload events, and malformed tool calls, then recommend setting changes. Use when a HangarBayCC session was slow, looped, garbled, or errored.
 ---
 
-# ornith-doctor
+# hangarbaycc-doctor
 
-Post-session diagnosis for the launch-ornith stack. Work through this
+Post-session diagnosis for the HangarBayCC stack. Work through this
 checklist and report findings with a concrete recommendation for each.
 
 ## 1. Is anything still running, and where?
 
 ```bash
-pgrep -ax ollama; pgrep -af ornith-temp-proxy
+pgrep -ax ollama; pgrep -af hangarbaycc-proxy
 curl -sf http://127.0.0.1:11434/api/version && curl -s http://127.0.0.1:11434/api/ps
 nvidia-smi --query-gpu=memory.total,memory.used --format=csv
 ```
 
 In `/api/ps`, `size_vram < size` means CPU spill → recommend a smaller
-context or more compressed KV cache (see the fit table in `launch-ornith.sh`).
+context or more compressed KV cache (see the fit table in `hangarbaycc.sh`).
 
-## 2. Server log — /tmp/ollama-ornith.log
+## 2. Server log — /tmp/ollama-hangarbaycc.log
 
 Look for:
 - `offloaded X/Y layers to GPU` with X < Y → spill (same fix as above).
@@ -33,7 +33,7 @@ Look for:
 - HTTP 4xx/5xx on `/v1/messages` → API-level failures; correlate with the
   proxy log.
 
-## 3. Proxy log — /tmp/ornith-temp-proxy.log
+## 3. Proxy log — /tmp/hangarbaycc-proxy.log
 
 Every generation gets a summary line:
 `POST /v1/messages -> 200 5.3s req=41200B resp=8100B stop=tool_use`.
@@ -54,7 +54,7 @@ Every generation gets a summary line:
   0.55–0.70).
 - `stripped N tool schema(s)` — should appear once shortly after launch. If
   N is 0, Claude Code's tool names changed; update `DISALLOWED_TOOLS` in
-  `launch-ornith.sh`.
+  `hangarbaycc.sh`.
 - `relay error:` lines → upstream died or timed out mid-stream; check the
   server log at the same timestamp.
 
@@ -71,5 +71,5 @@ Every generation gets a summary line:
 
 ## 5. Verify with data
 
-After changing a setting, run `/ornith-bench` (see that skill) before and
-after — 2–3 runs each — rather than judging from one interactive session.
+After changing a setting, run `/hangarbaycc-bench` (see that skill) before
+and after — 2–3 runs each — rather than judging from one interactive session.

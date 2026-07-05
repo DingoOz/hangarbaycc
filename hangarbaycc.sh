@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# launch-ornith.sh — launch Claude Code wired to a local Ollama model,
-#                    with a chosen KV cache precision and context window.
+# hangarbaycc.sh — HangarBayCC: launch Claude Code wired to a local Ollama
+#                   model, with a chosen KV cache precision and context window.
 #
 # VERIFIED FIT TABLE — measured on this RTX 5060 Ti (16 GB) via the preload
 # guard (/api/ps size_vram vs size). Numbers are total reported VRAM use.
@@ -37,8 +37,8 @@ set -euo pipefail
 HOST="127.0.0.1:11434"
 PROXY_HOST="127.0.0.1:11435"   # temperature-clamping proxy in front of HOST
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EDIT_RULES="$SCRIPT_DIR/ornith-editing-rules.md"
-TEMP_PROXY="$SCRIPT_DIR/ornith-temp-proxy.py"
+EDIT_RULES="$SCRIPT_DIR/hangarbaycc-editing-rules.md"
+TEMP_PROXY="$SCRIPT_DIR/hangarbaycc-proxy.py"
 
 # Small models emit malformed/hallucinated tool calls when too many tools are
 # in context. The temp proxy STRIPS these from the `tools` schema on every
@@ -165,7 +165,7 @@ sleep 2
 
 # --- 2. start our server with the settings above ------------------------------
 echo ">> Starting ollama serve..."
-nohup ollama serve >/tmp/ollama-ornith.log 2>&1 &
+nohup ollama serve >/tmp/ollama-hangarbaycc.log 2>&1 &
 disown
 until curl -sf "http://${HOST}/api/version" >/dev/null 2>&1; do sleep 0.5; done
 
@@ -176,7 +176,7 @@ if ! curl -sf "http://${HOST}/api/generate" \
   echo "!! Preload failed for model '$MODEL' (server returned an error)." >&2
   echo "!! Most likely the model isn't in the store the server is using." >&2
   echo "!!   store in use: ${OLLAMA_MODELS}" >&2
-  echo "!! Check 'ollama list', or 'ollama pull $MODEL'. See /tmp/ollama-ornith.log for details." >&2
+  echo "!! Check 'ollama list', or 'ollama pull $MODEL'. See /tmp/ollama-hangarbaycc.log for details." >&2
   exit 1
 fi
 
@@ -191,7 +191,7 @@ for m in json.load(sys.stdin).get("models", []):
               % (m.get("name"), (size - vram) / gib, size / gib))
 ')"; then
   echo "!! Could not verify GPU placement (/api/ps check failed)." >&2
-  echo "!! Not launching blind — check /tmp/ollama-ornith.log and ollama ps." >&2
+  echo "!! Not launching blind — check /tmp/ollama-hangarbaycc.log and ollama ps." >&2
   exit 1
 fi
 if [[ -n "$SPILL" ]]; then
@@ -212,7 +212,7 @@ STRIP_TOOLS="$(IFS=,; echo "${DISALLOWED_TOOLS[*]}")"
 if [[ -f "$TEMP_PROXY" ]]; then
   echo ">> Starting temperature proxy (:$PROXY_PORT -> $HOST, temp -> [$TEMP_FLOOR, $TEMP_CEIL], strip: $STRIP_TOOLS)..."
   nohup python3 "$TEMP_PROXY" "$PROXY_PORT" "$HOST" "$TEMP_FLOOR" "$TEMP_CEIL" \
-    "$TOP_P_CEIL" "$STRIP_TOOLS" >/tmp/ornith-temp-proxy.log 2>&1 &
+    "$TOP_P_CEIL" "$STRIP_TOOLS" >/tmp/hangarbaycc-proxy.log 2>&1 &
   disown
   until curl -sf "http://${PROXY_HOST}/api/version" >/dev/null 2>&1; do sleep 0.2; done
   export OLLAMA_HOST="$PROXY_HOST"

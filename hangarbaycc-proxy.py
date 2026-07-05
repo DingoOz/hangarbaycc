@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ornith-temp-proxy.py — transparent reverse proxy in front of the Ollama server.
+hangarbaycc-proxy.py — transparent reverse proxy in front of the Ollama server.
 
 Claude Code sends `temperature: 1.0` on every /v1/messages request, which
 overrides the model's preferred sampling and makes a small model produce far
@@ -38,14 +38,14 @@ band is the lever for that.
 
 Each /v1/messages generation is summarised to stderr (status, seconds, bytes,
 stop_reason, whether any content block was produced) so a dead session can be
-diagnosed from /tmp/ornith-temp-proxy.log after the fact.
+diagnosed from /tmp/hangarbaycc-proxy.log after the fact.
 
 Everything else is forwarded verbatim to UPSTREAM. All other routes
 (/api/version, /api/tags, model preload, ...) pass straight through, so
 `ollama launch claude` can be pointed at this port instead of the real server.
 
 Usage:
-    ornith-temp-proxy.py [LISTEN_PORT] [UPSTREAM_HOSTPORT] [TEMP_FLOOR] [TEMP_CEIL]
+    hangarbaycc-proxy.py [LISTEN_PORT] [UPSTREAM_HOSTPORT] [TEMP_FLOOR] [TEMP_CEIL]
                          [TOP_P_CEIL] [STRIP_TOOLS]
 Defaults: 11435  127.0.0.1:11434  0.55  0.70  0.95  ""
 """
@@ -229,7 +229,7 @@ class QuietServer(ThreadingHTTPServer):
 
 
 if __name__ == "__main__":
-    print(f">> ornith-temp-proxy: :{LISTEN_PORT} -> {UPSTREAM} "
+    print(f">> hangarbaycc-proxy: :{LISTEN_PORT} -> {UPSTREAM} "
           f"(temperature -> [{TEMP_FLOOR}, {TEMP_CEIL}], top_p <= {TOP_P_CEIL}, "
           f"repeat_penalty -> {REPEAT_PENALTY}, "
           f"strip_tools = {sorted(STRIP_TOOLS) or 'none'}, "

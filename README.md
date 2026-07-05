@@ -1,12 +1,14 @@
-# launch-ornith
+# HangarBayCC
 
 Launch [Claude Code](https://claude.com/claude-code) against a **local model**
 served by [Ollama](https://ollama.com) on a 16 GB GPU (RTX 5060 Ti), tuned to
-produce decent C / C++ / Python code.
+produce decent C / C++ / Python code. Multiple models sit in the "hangar";
+`hangarbaycc.sh` preps and launches whichever one you pick, like a hangar bay
+crewing up an aircraft before takeoff.
 
 ## What it does
 
-`launch-ornith.sh`:
+`hangarbaycc.sh`:
 
 1. Prompts for a model, context window (32K–256K), and KV cache precision
    (fp16 / q8_0 / q4_0). Each model carries its own max context and sampling
@@ -19,12 +21,12 @@ produce decent C / C++ / Python code.
    of the conversation, which takes minutes at 100K+ tokens).
 4. Preloads the model and **verifies it is fully on the GPU** via `/api/ps`
    (`size_vram == size`); aborts with advice if the KV cache spilled to CPU.
-5. Starts the request-rewriting proxy (`ornith-temp-proxy.py`) and points
+5. Starts the request-rewriting proxy (`hangarbaycc-proxy.py`) and points
    Claude Code at it.
 6. Hands off to Claude Code with the editing/verification rules from
-   `ornith-editing-rules.md` appended to the system prompt. When Claude Code
-   exits, the proxy is killed; the server is left running so the model stays
-   warm.
+   `hangarbaycc-editing-rules.md` appended to the system prompt. When Claude
+   Code exits, the proxy is killed; the server is left running so the model
+   stays warm.
 
 ## Models
 
@@ -35,7 +37,7 @@ produce decent C / C++ / Python code.
 | 3 | `qwen2.5-coder:14b` | strong raw coder, native 32K only; prefer q8_0 KV (fp16 KV can garble) |
 | 4 | `gpt-oss:20b` | 20B MoE, ~12 GB — strongest C/C++/Python + tool calling; max 128K; use q8_0 KV (f16 KV spills beyond 32K) |
 
-## The proxy (ornith-temp-proxy.py)
+## The proxy (hangarbaycc-proxy.py)
 
 A transparent reverse proxy between Claude Code and Ollama that rewrites every
 `/v1/messages` request:
@@ -60,7 +62,7 @@ A transparent reverse proxy between Claude Code and Ollama that rewrites every
   ("There's an issue with the selected model"). The proxy answers the route
   locally with a chars/4 estimate.
 - **Diagnostics.** One summary line per generation (status, time, bytes,
-  stop_reason, empty-response marker) in `/tmp/ornith-temp-proxy.log`.
+  stop_reason, empty-response marker) in `/tmp/hangarbaycc-proxy.log`.
 
 The launcher also forces `CLAUDE_CODE_SUBAGENT_MODEL=inherit` (via
 `--settings`, scoped to the launched session) so a stray subagent spawn reuses
@@ -68,9 +70,9 @@ the local model instead of erroring on an unreachable `sonnet` alias.
 
 ## The editing & verification rules
 
-`ornith-editing-rules.md` is appended to the system prompt. It steers a small
-model toward Write-over-Edit, byte-exact `old_string` matching — and a verify
-protocol: compile everything with `gcc/g++ -Wall -Wextra`, run it, run
+`hangarbaycc-editing-rules.md` is appended to the system prompt. It steers a
+small model toward Write-over-Edit, byte-exact `old_string` matching — and a
+verify protocol: compile everything with `gcc/g++ -Wall -Wextra`, run it, run
 `py_compile`/`pytest` for Python, and stop after 3 failed fix attempts instead
 of thrashing.
 
@@ -84,14 +86,14 @@ vibes.
 
 Baseline (2026-07-05, raw model sampling, single run each): `gpt-oss:20b`
 **8/8**; `ornith:latest` **4/8** (0/3 on the C tasks). For C/C++ work, pick
-gpt-oss. See `.claude/skills/ornith-bench/` — in a cloud Claude Code session in
-this repo, `/ornith-bench` runs it and `/ornith-doctor` diagnoses a bad
-session from the logs.
+gpt-oss. See `.claude/skills/hangarbaycc-bench/` — in a cloud Claude Code
+session in this repo, `/hangarbaycc-bench` runs it and `/hangarbaycc-doctor`
+diagnoses a bad session from the logs.
 
 ## Usage
 
 ```bash
-./launch-ornith.sh
+./hangarbaycc.sh
 ```
 
 Afterwards, `sudo systemctl start ollama` restores the system Ollama service

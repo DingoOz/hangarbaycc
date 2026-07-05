@@ -11,7 +11,7 @@
 #             raw server = the model's own sampling). Point it at 127.0.0.1:11435
 #             instead to bench THROUGH the temp proxy and measure a temp band.
 #
-# The server must already be running (launch-ornith.sh starts one, or:
+# The server must already be running (hangarbaycc.sh starts one, or:
 #   OLLAMA_CONTEXT_LENGTH=32768 ollama serve).
 # Each task sends one prompt, extracts the fenced code block from the reply,
 # and runs the task's check.sh on it. Results land in bench/results/.
@@ -23,7 +23,7 @@ HOSTPORT="${2:-127.0.0.1:11434}"
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TASKS_DIR="$BENCH_DIR/tasks"
 RESULTS_DIR="$BENCH_DIR/results"
-WORK="$(mktemp -d /tmp/ornith-bench.XXXXXX)"
+WORK="$(mktemp -d /tmp/hangarbaycc-bench.XXXXXX)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="$RESULTS_DIR/${MODEL//[:\/]/_}-$STAMP.md"
 mkdir -p "$RESULTS_DIR"
@@ -33,7 +33,7 @@ if ! curl -sf --max-time 3 "http://$HOSTPORT/api/version" >/dev/null; then
   exit 1
 fi
 
-echo "# ornith-bench: $MODEL" > "$OUT"
+echo "# hangarbaycc-bench: $MODEL" > "$OUT"
 {
   echo ""
   echo "- endpoint: \`$HOSTPORT\`"

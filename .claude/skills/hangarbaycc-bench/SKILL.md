@@ -1,9 +1,9 @@
 ---
-name: ornith-bench
-description: Benchmark a local Ollama model on the C/C++/Python task set and produce a pass/fail scorecard. Use when comparing models (ornith, gemma4, qwen2.5-coder, gpt-oss), context/KV settings, or temperature bands for the launch-ornith tooling — data instead of vibes.
+name: hangarbaycc-bench
+description: Benchmark a local Ollama model on the C/C++/Python task set and produce a pass/fail scorecard. Use when comparing models (ornith, gemma4, qwen2.5-coder, gpt-oss), context/KV settings, or temperature bands for the HangarBayCC tooling — data instead of vibes.
 ---
 
-# ornith-bench
+# hangarbaycc-bench
 
 Runs `bench/run-bench.sh`: for each task in `bench/tasks/*/` it sends one
 prompt to the model's Anthropic-compat endpoint, extracts the fenced code
@@ -14,7 +14,7 @@ block from the reply, and runs the task's `check.sh` (compile with
 ## How to run
 
 1. Make sure an Ollama server is up with the settings you want to measure.
-   Either `./launch-ornith.sh` already started one, or start one manually:
+   Either `./hangarbaycc.sh` already started one, or start one manually:
 
    ```bash
    pkill -x ollama; sleep 2
@@ -36,7 +36,7 @@ block from the reply, and runs the task's `check.sh` (compile with
    tool-strip config (this is how the launched sessions actually run):
 
    ```bash
-   python3 ornith-temp-proxy.py 11435 127.0.0.1:11434 0.55 0.70 0.95 "" &
+   python3 hangarbaycc-proxy.py 11435 127.0.0.1:11434 0.55 0.70 0.95 "" &
    bench/run-bench.sh ornith:latest 127.0.0.1:11435
    kill %1
    ```

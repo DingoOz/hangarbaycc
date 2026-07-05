@@ -2,17 +2,18 @@
 #
 # launch-aider.sh — launch Aider wired to the local Ornith model.
 #
-# Sibling of launch-ornith.sh. Same model picker, context/KV-cache guard, and
-# GPU-spill abort, but hands off to Aider instead of Claude Code.
+# Sibling of hangarbaycc.sh (the HangarBayCC project). Same model picker,
+# context/KV-cache guard, and GPU-spill abort, but hands off to Aider instead
+# of Claude Code.
 #
 # Why Aider for a 9B-class model:
 #   - Forgiving edit formats (whole-file / unified-diff) instead of byte-exact
 #     Edit matching — removes the #1 failure mode for small models, so the
-#     ornith-editing-rules.md band-aid is unnecessary here.
+#     hangarbaycc-editing-rules.md band-aid is unnecessary here.
 #   - Native temperature control (--temperature), so no temp-clamping proxy.
 #   - Smaller prompt/tool surface leaves more context window for real work.
 #
-# See launch-ornith.sh for the measured VRAM fit table; it applies unchanged
+# See hangarbaycc.sh for the measured VRAM fit table; it applies unchanged
 # (the model + KV cache live in the same ollama server process).
 #
 set -euo pipefail
@@ -20,10 +21,10 @@ set -euo pipefail
 HOST="127.0.0.1:11434"
 TARGET_TEMP="0.4"             # a 9B model wants lower than the default temp
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EDIT_RULES="$SCRIPT_DIR/ornith-editing-rules.md"
+EDIT_RULES="$SCRIPT_DIR/hangarbaycc-editing-rules.md"
 
 # --- interactive selection -----------------------------------------------------
-echo "Select model:   (all fit any ctx/KV on 16 GB; see fit table in launch-ornith.sh)"
+echo "Select model:   (all fit any ctx/KV on 16 GB; see fit table in hangarbaycc.sh)"
 echo "  1) ornith:latest         5.6 GB weights, full 256K context, best for agents"
 echo "  2) gemma4:latest         8B Q4_K_M, max 128K context"
 echo "  3) qwen2.5-coder:14b      strong coder, native 32K context (capped at 32K)"
@@ -94,7 +95,7 @@ sleep 2
 
 # --- 2. start our server with the settings above ------------------------------
 echo ">> Starting ollama serve..."
-nohup ollama serve >/tmp/ollama-ornith.log 2>&1 &
+nohup ollama serve >/tmp/ollama-hangarbaycc.log 2>&1 &
 disown
 until curl -sf "http://${HOST}/api/version" >/dev/null 2>&1; do sleep 0.5; done
 
@@ -105,7 +106,7 @@ if ! curl -sf "http://${HOST}/api/generate" \
   echo "!! Preload failed for model '$MODEL' (server returned an error)." >&2
   echo "!! Most likely the model isn't in the store the server is using." >&2
   echo "!!   store in use: ${OLLAMA_MODELS:-$HOME/.ollama/models}" >&2
-  echo "!! Check 'ollama list', or 'ollama pull $MODEL'. See /tmp/ollama-ornith.log for details." >&2
+  echo "!! Check 'ollama list', or 'ollama pull $MODEL'. See /tmp/ollama-hangarbaycc.log for details." >&2
   exit 1
 fi
 
