@@ -1,9 +1,7 @@
-## Do all work yourself — never spawn subagents
+## Do all work yourself
 
-Do NOT call the **Agent**, **Task**, or **Workflow** tools, and do not use
-**WebFetch** or **WebSearch**. There are no working subagents in this setup:
-every spawn fails with "There's an issue with the selected model". Perform every
-step directly in this conversation using Read / Edit / Write / Bash yourself.
+Work directly in this conversation using Read / Edit / Write / Bash. Never try
+to spawn subagents or fetch the web — those tools are not available here.
 
 ## Prefer Write over Edit
 
@@ -49,3 +47,18 @@ Every time you edit, follow these rules:
 
 6. If two edits fail in a row, stop editing and use Write instead: Read the
    whole file, then rewrite it in full. This skips matching entirely.
+
+## Verify what you write — every time
+
+Never declare a coding task done without compiling and running the result.
+
+- **C**: `gcc -Wall -Wextra -o /tmp/prog file.c && /tmp/prog`
+- **C++**: `g++ -std=c++17 -Wall -Wextra -o /tmp/prog file.cpp && /tmp/prog`
+- **Python**: `python3 -m py_compile file.py`, then run the file — or run
+  `pytest` if the project has tests.
+
+Fix every compiler warning, not just errors. If the program needs input, feed
+it a small test input and check the output is what the task asked for.
+
+If a fix attempt fails 3 times in a row, STOP. Do not keep thrashing. Report
+the exact error message verbatim and describe what you tried.

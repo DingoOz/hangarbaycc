@@ -3,9 +3,9 @@
 ornith-temp-proxy.py — transparent reverse proxy in front of the Ollama server.
 
 Claude Code sends `temperature: 1.0` on every /v1/messages request, which
-overrides Ornith's preferred sampling and makes a 9B model produce far more
-malformed / hallucinated tool calls. Ollama honours the request value over the
-Modelfile, and Claude Code has no temperature flag — so we clamp it here.
+overrides the model's preferred sampling and makes a small model produce far
+more malformed / hallucinated tool calls. Ollama honours the request value over
+the Modelfile, and Claude Code has no temperature flag — so we clamp it here.
 
 We clamp temperature into a *band* [TEMP_FLOOR, TEMP_CEIL] rather than pinning it
 to a single low value. Pinning near-greedy (the old temp=0.4) keeps tool calls
@@ -13,6 +13,14 @@ clean but makes a small model prone to agentic repetition loops: when the contex
 keeps re-presenting an identical state, the argmax next-action reproduces that
 state, which re-feeds the same context — a self-reinforcing fixed point. A band
 keeps enough entropy to escape the loop while still cutting malformed tool calls.
+The band is per-model — the launcher passes the right one (e.g. gpt-oss wants
+temp≈1.0, so its band is 0.9–1.0 and the clamp is effectively a no-op).
+
+We also strip named tools from the `tools` array (STRIP_TOOLS, comma-separated).
+--disallowedTools only auto-denies a call at execution time — the model still
+sees the schema and still tries. Removing the entry here means the model never
+sees the tool at all: no hallucinated calls, and several thousand tokens of
+schema freed for actual code context.
 
 We also inject `repeat_penalty` / `repeat_last_n` to suppress the *within-a-single-
 generation* runaway (e.g. the same method emitted over and over). These are Ollama
@@ -27,7 +35,8 @@ Everything else is forwarded verbatim to UPSTREAM. All other routes
 
 Usage:
     ornith-temp-proxy.py [LISTEN_PORT] [UPSTREAM_HOSTPORT] [TEMP_FLOOR] [TEMP_CEIL]
-Defaults: 11435  127.0.0.1:11434  0.55  0.70
+                         [TOP_P_CEIL] [STRIP_TOOLS]
+Defaults: 11435  127.0.0.1:11434  0.55  0.70  0.95  ""
 """
 import http.client
 import json
@@ -38,7 +47,8 @@ LISTEN_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 11435
 UPSTREAM = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:11434"
 TEMP_FLOOR = float(sys.argv[3]) if len(sys.argv) > 3 else 0.55
 TEMP_CEIL = float(sys.argv[4]) if len(sys.argv) > 4 else 0.70
-TOP_P_CEIL = 0.95
+TOP_P_CEIL = float(sys.argv[5]) if len(sys.argv) > 5 else 0.95
+STRIP_TOOLS = {t.strip() for t in (sys.argv[6] if len(sys.argv) > 6 else "").split(",") if t.strip()}
 REPEAT_PENALTY = 1.2
 REPEAT_LAST_N = 256
 
@@ -48,10 +58,13 @@ HOP_BY_HOP = {
     "te", "trailers", "transfer-encoding", "upgrade", "content-length",
 }
 
+_last_strip_count = None  # log only when the stripped count changes
+
 
 def rewrite_body(body: bytes) -> bytes:
-    """Clamp temperature into a band, cap top_p, and inject anti-repetition
-    options in a JSON body; pass anything else unchanged."""
+    """Clamp temperature into a band, cap top_p, strip named tool schemas, and
+    inject anti-repetition options in a JSON body; pass anything else unchanged."""
+    global _last_strip_count
     if not body:
         return body
     try:
@@ -61,6 +74,20 @@ def rewrite_body(body: bytes) -> bytes:
     if not isinstance(data, dict):
         return body
     changed = False
+
+    # Remove stripped tools from the schema the model sees.
+    tools = data.get("tools")
+    if STRIP_TOOLS and isinstance(tools, list):
+        kept = [t for t in tools
+                if not (isinstance(t, dict) and t.get("name") in STRIP_TOOLS)]
+        stripped = len(tools) - len(kept)
+        if stripped:
+            data["tools"] = kept
+            changed = True
+        if stripped != _last_strip_count:
+            _last_strip_count = stripped
+            sys.stderr.write(f"[proxy] stripped {stripped} tool schema(s), "
+                             f"{len(kept)} remain\n")
 
     # Clamp temperature into [TEMP_FLOOR, TEMP_CEIL]. Default it to the floor
     # when absent so a request with no temperature still gets some entropy.
@@ -134,6 +161,7 @@ class Proxy(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f">> ornith-temp-proxy: :{LISTEN_PORT} -> {UPSTREAM} "
-          f"(temperature -> [{TEMP_FLOOR}, {TEMP_CEIL}], "
-          f"repeat_penalty -> {REPEAT_PENALTY})", flush=True)
+          f"(temperature -> [{TEMP_FLOOR}, {TEMP_CEIL}], top_p <= {TOP_P_CEIL}, "
+          f"repeat_penalty -> {REPEAT_PENALTY}, "
+          f"strip_tools = {sorted(STRIP_TOOLS) or 'none'})", flush=True)
     ThreadingHTTPServer(("127.0.0.1", LISTEN_PORT), Proxy).serve_forever()
