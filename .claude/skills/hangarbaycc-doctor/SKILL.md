@@ -44,8 +44,14 @@ In `--remote` mode this file is on the remote host: `ssh HOST tail -50
   The launcher sets `OLLAMA_KEEP_ALIVE=-1`; if reloads still happen, something
   else restarted the server — check timestamps against systemd (`journalctl -u
   ollama`) and whether two servers fought over the port.
-- context-shift / truncation messages → the conversation outgrew `num_ctx`;
-  recommend a larger context choice next launch.
+- context-shift / truncation messages → the conversation outgrew `num_ctx`
+  WITHOUT Claude Code compacting first. The launcher sets
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (via `--settings`) to the chosen context
+  specifically to make Claude Code compact before this happens; if you see
+  context-shift anyway, check `/context` inside the session for an
+  "Auto-compact window: N tokens (from CLAUDE_CODE_AUTO_COMPACT_WINDOW)" line —
+  if it's absent (or shows the default 200k), the `--settings` JSON didn't
+  reach Claude Code. Also just recommend a larger context choice next launch.
 - HTTP 4xx/5xx on `/v1/messages` → API-level failures; correlate with the
   proxy log.
 

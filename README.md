@@ -80,6 +80,26 @@ The launcher also forces `CLAUDE_CODE_SUBAGENT_MODEL=inherit` (via
 `--settings`, scoped to the launched session) so a stray subagent spawn reuses
 the local model instead of erroring on an unreachable `sonnet` alias.
 
+## The context-window mismatch
+
+Claude Code doesn't recognize a local Ollama model ID, so it assumes its
+default 200K context window — regardless of what the model's real limit is.
+That's more than cosmetic: auto-compaction is driven by that assumed window,
+so with a 128K model it would never trigger before Ollama's server-side limit,
+at which point llama-server silently context-shifts (drops the oldest
+messages — including the appended editing rules) instead of Claude Code
+compacting on purpose.
+
+The launcher sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (via the same `--settings`
+mechanism, pinned to the context you picked) so auto-compaction fires at the
+real limit. `/context` then shows an accurate "Auto-compact window: `<N>`
+tokens (from CLAUDE_CODE_AUTO_COMPACT_WINDOW)" line. The headline total at the
+top of `/context` still reads 200k regardless — that part is hardcoded per
+model ID with no override that doesn't *also* disable auto-compaction entirely
+(`DISABLE_COMPACT` + `CLAUDE_CODE_MAX_CONTEXT_TOKENS` would fix the headline
+number but turn compaction off outright — worse than a cosmetically wrong
+number, so it isn't wired in here).
+
 ## The editing & verification rules
 
 `hangarbaycc-editing-rules.md` is appended to the system prompt. It steers a

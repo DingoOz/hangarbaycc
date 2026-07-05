@@ -176,9 +176,27 @@ DISALLOWED_TOOLS=(Task Agent Workflow WebFetch WebSearch NotebookEdit)
 # 'sonnet' alias — which this local Ollama cannot serve, so every spawned agent
 # panel errors with "There's an issue with the selected model". Forcing "inherit"
 # makes any subagent reuse the running local model instead, so a stray Agent call
-# is harmless rather than an error. Passed via --settings (scoped to THIS launch
-# only; your normal cloud Claude is untouched). settings.env beats process env.
-SUBAGENT_SETTINGS='{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"inherit"}}'
+# is harmless rather than an error.
+#
+# Claude Code doesn't know this model, so it assumes its 200K default context
+# window: /context shows 200k regardless of what we actually configured, and —
+# more importantly — auto-compaction would never trigger before the Ollama
+# server's real limit, at which point llama-server silently context-shifts
+# (drops the oldest messages, including our appended editing rules) instead of
+# Claude Code compacting on purpose. CLAUDE_CODE_AUTO_COMPACT_WINDOW pins the
+# effective/auto-compact window to NUM_CTX, so compaction fires at the real
+# limit; /context then shows "Auto-compact window: <NUM_CTX> tokens (from
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW)". The headline total still reads 200k —
+# that's cosmetic only, hardcoded per model ID with no override that doesn't
+# also disable auto-compaction entirely (rejected: worse than a wrong number).
+#
+# Both settings passed via --settings (scoped to THIS launch only; your normal
+# cloud Claude is untouched). settings.env beats process env. Built here,
+# after NUM_CTX is finalized (post MAX_CTX clamp), so it reflects the actual
+# server context rather than the raw menu choice.
+build_launch_settings() {
+  printf '{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"inherit","CLAUDE_CODE_AUTO_COMPACT_WINDOW":"%s"}}' "$NUM_CTX"
+}
 
 # --- interactive selection -----------------------------------------------------
 # Each model carries its own max context and sampling band. Claude Code sends
@@ -239,6 +257,9 @@ if [[ "$NUM_CTX" -gt "$MAX_CTX" ]]; then
   NUM_CTX=$MAX_CTX
 fi
 
+# NUM_CTX is now final — build the Claude Code launch settings against it.
+LAUNCH_SETTINGS="$(build_launch_settings)"
+
 echo "Select KV cache type:"
 echo "  1) fp16  (f16)   full precision, largest"
 echo "  2) q8_0          half size, near-lossless"
@@ -267,6 +288,7 @@ export OLLAMA_HOST="$API_HOST"
 
 echo ">> Model: $MODEL (store: $MODEL_STORE on ${SERVER_LABEL})"
 echo ">> Context: $NUM_CTX | KV cache: $KV_CACHE_TYPE | temp band: [$TEMP_FLOOR, $TEMP_CEIL]"
+echo ">> Auto-compact window: $NUM_CTX (matches server context; /context headline still shows 200k — cosmetic)"
 
 # --- 0. GPU must be healthy before we do anything -----------------------------
 if ! remote_exec "nvidia-smi >/dev/null 2>&1"; then
@@ -358,14 +380,14 @@ if [[ -f "$EDIT_RULES" ]]; then
   # Args after `--` are forwarded to Claude Code itself (ollama launch passes
   # them through). The flags are NOT `ollama launch` flags, so they go here.
   ollama launch claude --model "$MODEL" -y -- \
-    --settings "$SUBAGENT_SETTINGS" \
+    --settings "$LAUNCH_SETTINGS" \
     --append-system-prompt "$(cat "$EDIT_RULES")" \
     --disallowedTools "${DISALLOWED_TOOLS[@]}"
 else
   echo "!! $EDIT_RULES not found — launching without the editing-rules prompt." >&2
   echo ">> Stripping tools at the proxy (and auto-denying as backstop): ${DISALLOWED_TOOLS[*]}"
   ollama launch claude --model "$MODEL" -y -- \
-    --settings "$SUBAGENT_SETTINGS" \
+    --settings "$LAUNCH_SETTINGS" \
     --disallowedTools "${DISALLOWED_TOOLS[@]}"
 fi
 
