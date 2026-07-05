@@ -37,6 +37,18 @@ crewing up an aircraft before takeoff.
 | 3 | `qwen2.5-coder:14b` | strong raw coder, native 32K only; prefer q8_0 KV (fp16 KV can garble) |
 | 4 | `gpt-oss:20b` | 20B MoE, ~12 GB — strongest C/C++/Python + tool calling; max 128K; use q8_0 KV (f16 KV spills beyond 32K) |
 
+### Recommended configuration
+
+**`gpt-oss:20b` at 128K context with `q8_0` KV cache** is the preferred setup.
+It scored **8/8** on the C/C++/Python bench (vs 4/8 for the next best), and this
+combination is the sweet spot: `q8_0` is near-lossless yet keeps the whole model
++ 128K KV on the 16 GB GPU (f16 KV spills to CPU beyond 32K on this model, and
+q4_0 buys nothing here since q8_0 already fits). At the launcher prompts, pick:
+
+- Model: **4** (`gpt-oss:20b`)
+- Context: **3** (128K / 131072)
+- KV cache: **2** (`q8_0`)
+
 ## The proxy (hangarbaycc-proxy.py)
 
 A transparent reverse proxy between Claude Code and Ollama that rewrites every
@@ -109,6 +121,10 @@ the LAN (e.g. `ml-server`):
 # or: HANGARBAY_REMOTE=ml-server ./hangarbaycc.sh
 ```
 
+If you run `./hangarbaycc.sh` with no flag or env var, an interactive menu asks
+whether to run locally or against a remote host, defaulting the host to
+`ml-server` — so you can pick remote mode without remembering the flag.
+
 The **Ollama server runs on the remote host** over SSH; the **proxy and Claude
 Code stay on the laptop**, talking to the remote Ollama directly over the LAN
 (`hangarbaycc-proxy.py`'s upstream just becomes `ml-server:11434` instead of
@@ -139,10 +155,35 @@ check the remote host's firewall allows port 11434 from your subnet, and tail
 /tmp/ollama-hangarbaycc.log`). See `.claude/skills/hangarbaycc-doctor/` for a
 fuller checklist — it covers remote-mode log locations too.
 
-## Requirements
+## Dependencies
 
-- `ollama` ≥ 0.30 (with `ollama launch claude` integration)
-- `nvidia-smi` / an NVIDIA GPU on whichever machine hosts the model (tables
-  measured on an RTX 5060 Ti 16 GB)
-- Claude Code, `python3`, `gcc`/`g++` (for the bench checks)
-- For `--remote`: SSH access (ideally key-based) to the remote host
+Everything the launcher shells out to. On a single-machine setup all of these
+live on one box; in `--remote` mode they split between the laptop (client) and
+the GPU host (server) as noted.
+
+**On the machine you run `hangarbaycc.sh` from (client):**
+- **`bash`** ≥ 4 — the launcher uses `set -euo pipefail`, arrays, and `[[ ]]`.
+- **`ollama`** CLI ≥ 0.30, with the `ollama launch claude` integration — used to
+  hand off to Claude Code. In `--remote` mode this is the *client* only; it does
+  not need to run a local server.
+- **Claude Code** (`claude`) — installed and logged in, since `ollama launch
+  claude` drives it.
+- **`python3`** ≥ 3.8 — runs the request-rewriting proxy
+  (`hangarbaycc-proxy.py`) and the GPU-spill check (stdlib only, no pip
+  packages).
+- **`curl`** — health checks and the preload probe.
+- **`ssh`** — only for `--remote` (key-based auth strongly preferred; a launch
+  makes several separate SSH calls).
+
+**On the machine that hosts the model (server — the same box locally, or the
+`--remote` host):**
+- **NVIDIA GPU + `nvidia-smi`** — a health check aborts the launch if it fails.
+  The fit tables were measured on an RTX 5060 Ti (16 GB); other cards work but
+  the VRAM numbers will differ.
+- **`ollama`** with `ollama serve`, plus the chosen model pulled into either
+  `/var/lib/ollama/models` or `~/.ollama/models`.
+- **`sudo`** — only if the systemd `ollama` service is normally active, to
+  stop/restart it around the session.
+
+**For the benchmark (`bench/`) only:**
+- **`gcc` / `g++`** — the bench compiles and runs the C/C++ tasks to score them.

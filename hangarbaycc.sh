@@ -12,6 +12,9 @@
 #                                     (hostname, IP, or ssh-config alias).
 #   HANGARBAY_REMOTE=HOST ./hangarbaycc.sh   same, via env var instead of a flag.
 #
+# If neither the flag nor the env var is given, an interactive menu asks whether
+# to run locally or against a remote host (the remote default is 'ml-server').
+#
 # Remote mode requires: `ssh HOST` already works (key-based auth strongly
 # preferred — several separate ssh calls happen per launch); HOST has the GPU,
 # ollama, and the model store; HOST's Ollama binds 0.0.0.0:11434, so it is
@@ -61,7 +64,8 @@ Usage: hangarbaycc.sh [-r|--remote HOST]
   -h, --help           Show this help.
 
 HOST may also come from the HANGARBAY_REMOTE environment variable; the flag
-takes precedence if both are given.
+takes precedence if both are given. If neither is set, an interactive menu asks
+whether to run locally or against a remote host (default: ml-server).
 USAGE
 }
 
@@ -75,6 +79,26 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 REMOTE="${REMOTE:-${HANGARBAY_REMOTE:-}}"
+
+# If no host was given via flag or env var, offer an interactive choice between
+# running everything locally or targeting a remote Ollama server. A flag/env var
+# takes precedence, so this is skipped when either was supplied; it's also
+# skipped when stdin isn't a terminal (non-interactive/CI use), where we can't
+# prompt — that falls through to local mode.
+DEFAULT_REMOTE="ml-server"
+if [[ -z "$REMOTE" && -t 0 ]]; then
+  echo "Select Ollama server location:"
+  echo "  1) Local        run the Ollama server on this machine"
+  echo "  2) Remote host  run it on another machine over SSH (default: $DEFAULT_REMOTE)"
+  read -rp "Server [1-2, default 1]: " SERVER_CHOICE
+  case "${SERVER_CHOICE:-1}" in
+    1) REMOTE="" ;;
+    2) read -rp "Remote host [$DEFAULT_REMOTE]: " REMOTE_INPUT
+       REMOTE="${REMOTE_INPUT:-$DEFAULT_REMOTE}" ;;
+    *) echo "!! Invalid server choice: $SERVER_CHOICE" >&2; exit 1 ;;
+  esac
+fi
+
 SERVER_LABEL="${REMOTE:-local}"
 
 # --- helpers for running a command on the target host (local or --remote) -----
