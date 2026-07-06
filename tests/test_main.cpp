@@ -16,3 +16,10 @@ TEST_CASE("Movement clamping") {
     CHECK(state.playerX >= 0.f);
     CHECK(state.playerX <= hangarbay::SCREEN_WIDTH - 32.f);
 }
+
+TEST_CASE("Scroll offset") {
+    hangarbay::GameState state;
+    float dt = 2.f;
+    state.update(dt, hangarbay::Input{});
+    CHECK(doctest::Approx(state.scrollOffset).epsilon(0.001) == hangarbay::GameState::SCROLL_SPEED * dt);
+}

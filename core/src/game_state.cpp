@@ -1,2 +1,1 @@
-#include "../include/GameState.hpp"
-// Implementation placeholder
+/* Placeholder for future core implementation */
