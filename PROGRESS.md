@@ -1,5 +1,5 @@
 - [ ] Playfield scrolls upward continuously at a stable rate; background suggests distinct terrain per level.
-- [ ] Player ship has 8-directional movement (orthogonal + diagonal), clamped to visible playfield, consistent speed.
+- [x] Player ship has 8-directional movement (orthogonal + diagonal), clamped to visible playfield, consistent speed.
 - [ ] Primary weapon fires; fire rate capped and frame-rate independent.
 - [ ] At least four distinct weapon types collectable via power-up drops.
 - [ ] Weapon "expansion" enhanced up to THREE levels via dedicated input, capped at 3, reset on new weapon switch.
