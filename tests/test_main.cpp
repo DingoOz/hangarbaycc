@@ -23,3 +23,26 @@ TEST_CASE("Scroll offset") {
     state.update(dt, hangarbay::Input{});
     CHECK(doctest::Approx(state.scrollOffset).epsilon(0.001) == hangarbay::GameState::SCROLL_SPEED * dt);
 }
+
+TEST_CASE("Fire rate") {
+    hangarbay::GameState state;
+    hangarbay::Input input{.fire = true};
+    float dt = 0.05f; // less than 1/5
+    state.update(dt, input);
+    CHECK(state.bullets.size() == 0);
+
+    for (int i=0;i<4;i++) {
+        state.update(0.05f, input); // accumulate time to exceed fire interval
+    }
+    CHECK(state.bullets.size() == 1);
+}
+
+TEST_CASE("Multiple fire rate") {
+    hangarbay::GameState state;
+    hangarbay::Input input{.fire = true};
+    float dt = 0.05f; // 20 frames per second approx
+    for (int i=0;i<20;i++) { // 1 second total
+        state.update(dt, input);
+    }
+    CHECK(state.bullets.size() == 5); // floor(1 * FIRE_RATE)
+}

@@ -1,6 +1,6 @@
 - [x] Playfield scrolls upward continuously at a stable rate; background suggests distinct terrain per level.
 - [x] Player ship has 8-directional movement (orthogonal + diagonal), clamped to visible playfield, consistent speed.
-- [ ] Primary weapon fires; fire rate capped and frame-rate independent.
+- [x] Primary weapon fires; fire rate capped and frame-rate independent.
 - [ ] At least four distinct weapon types collectable via power-up drops.
 - [ ] Weapon "expansion" enhanced up to THREE levels via dedicated input, capped at 3, reset on new weapon switch.
 - [ ] Smart bomb: starts with exactly three. Clears all on-screen enemies (except bosses) and enemy bullets; floor at zero.
