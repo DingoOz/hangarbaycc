@@ -1,4 +1,3 @@
-- Assumed WeaponType enum includes None, Laser, Missile, Plasma, Bomb.
-- Switching weapon resets expansion level.
-- Maximum of three expansions allowed per weapon.
-- Implemented methods switchWeapon and expandWeapon in GameState.
+- Implemented smart bomb placeholder; bombsRemaining initialized to 3.
+- Updated weapon system with switchWeapon, expandWeapon, and MAX_EXPANSION_LEVEL.
+- Added WeaponType enum and tests for switching and expansion limits.

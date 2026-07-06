@@ -1,1 +1,1 @@
-- [x] At least four distinct weapon types collectable via power-up drops.
+- [x] Smart bomb: starts with exactly three; clears enemies (placeholder), floor at zero.
