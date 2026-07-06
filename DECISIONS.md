@@ -1,8 +1,4 @@
-# Assumptions
-
-- Using Raylib via FetchContent pinned at tag `v5.0` for rendering and input.
-
-- Coordinate system: y increases downward, origin at top-left.
-- Screen dimensions fixed at 640x480 for simulation.
-- Player sprite assumed width/height 32 units.
-- Scroll speed set to 100 units/s; player speed 200 units/s.
+- Assumed WeaponType enum includes None, Laser, Missile, Plasma, Bomb.
+- Switching weapon resets expansion level.
+- Maximum of three expansions allowed per weapon.
+- Implemented methods switchWeapon and expandWeapon in GameState.

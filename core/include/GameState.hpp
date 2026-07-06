@@ -35,6 +35,22 @@ struct GameState {
     std::vector<Bullet> bullets;
     float timeSinceLastShot{0.f};
 
+    enum class WeaponType { None = 0, Laser, Missile, Plasma, Bomb };
+    WeaponType currentWeapon{WeaponType::None};
+    int expansionLevel{0};
+    static constexpr int MAX_EXPANSION_LEVEL = 3;
+
+    void switchWeapon(WeaponType newType) {
+        if (newType != currentWeapon) {
+            currentWeapon = newType;
+            expansionLevel = 0; // reset on new weapon
+        }
+    }
+
+    void expandWeapon() {
+        if (expansionLevel < MAX_EXPANSION_LEVEL)
+            ++expansionLevel;
+    }
     void update(float dt, const Input& input) {
         // apply scrolling
         scrollOffset += SCROLL_SPEED * dt;
