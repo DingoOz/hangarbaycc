@@ -85,6 +85,14 @@ struct GameState {
             timeSinceLastShot = 0.f;
         }
     }
+
+    int bombsRemaining{3};
+    void activateSmartBomb() {
+        if (bombsRemaining > 0) {
+            // placeholder: clearing logic will be added later
+            --bombsRemaining;
+        }
+    }
 };
 
 } // namespace hangarbay
