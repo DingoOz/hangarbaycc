@@ -1,0 +1,18 @@
+- [ ] Playfield scrolls upward continuously at a stable rate; background suggests distinct terrain per level.
+- [ ] Player ship has 8-directional movement (orthogonal + diagonal), clamped to visible playfield, consistent speed.
+- [ ] Primary weapon fires; fire rate capped and frame-rate independent.
+- [ ] At least four distinct weapon types collectable via power-up drops.
+- [ ] Weapon "expansion" enhanced up to THREE levels via dedicated input, capped at 3, reset on new weapon switch.
+- [ ] Smart bomb: starts with exactly three. Clears all on-screen enemies (except bosses) and enemy bullets; floor at zero.
+- [ ] Two commanders selectable at start, with at least one meaningful stat difference (e.g., speed vs fire rate).
+- [ ] At least three airborne enemy types distinct patterns (straight dive, sine weave, homing-ish). At least one returns fire.
+- [ ] Ground-based turrets that scroll with terrain and fire aimed shots at the player.
+- [ ] At least three levels; each ends with boss. Boss has health bar, multiple phases, immune to smart bomb.
+- [ ] Defeating final boss triggers victory state.
+- [ ] Collision detection: player-vs-enemy, player-vs-bullet, bullet vs enemy/boss, pickup vs player.
+- [ ] Lives system with respawn and brief invulnerability; game over when lives reach zero.
+- [ ] Score accrues from kills; HUD shows score, lives, bombs remaining, current weapon and expansion level.
+- [ ] Difficulty ramps across levels (spawn density/ aggression increases).
+- [ ] Title screen -> commander select -> gameplay -> pause toggle -> game over/victory -> title, all crash-free.
+- [ ] Stable 60 FPS via fixed simulation timestep with interpolation or accumulator; frame-rate independent behaviour.
+- [ ] Mute key to silence audio.

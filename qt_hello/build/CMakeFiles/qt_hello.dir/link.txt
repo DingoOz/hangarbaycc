@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/qt_hello.dir/main.cpp.o -o qt_hello  /usr/lib/x86_64-linux-gnu/libQt5Widgets.so.5.15.13 /usr/lib/x86_64-linux-gnu/libQt5Gui.so.5.15.13 /usr/lib/x86_64-linux-gnu/libQt5Core.so.5.15.13 

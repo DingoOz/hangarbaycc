@@ -53,32 +53,49 @@
 # preload guard aborts on a CPU spill; if it triggers, re-run with a smaller
 # context and/or more compressed KV cache.
 #
+# OPTIONAL: voice dictation (--dictate / HANGARBAY_DICTATE=1, remote mode
+# only). Starts whisper-server (whisper.cpp, CUDA) on the GPU host's spare
+# VRAM AFTER the model above is confirmed 100% on GPU (~0.6 GB for the
+# default small.en q8_0 model — e.g. gpt-oss:20b @128K/q8_0 leaves ~3.5 GB of
+# headroom per the table above). One-time setup: ./setup-whisper-server.sh
+# [HOST]. Then bind hangarbay-dictate.sh to a hotkey to talk into the Claude
+# Code prompt. See README.md "Voice dictation" for details.
+#
 set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: hangarbaycc.sh [-r|--remote HOST]
+Usage: hangarbaycc.sh [-r|--remote HOST] [-d|--dictate]
 
   -r, --remote HOST   Run the Ollama server on HOST over SSH instead of this
                        machine. The proxy and Claude Code still run here.
+  -d, --dictate        Start voice dictation (whisper-server on the GPU host).
+                       Remote mode only; see README.md "Voice dictation".
   -h, --help           Show this help.
 
 HOST may also come from the HANGARBAY_REMOTE environment variable; the flag
 takes precedence if both are given. If neither is set, an interactive menu asks
 whether to run locally or against a remote host (default: ml-server).
+
+--dictate may also come from HANGARBAY_DICTATE=1; the flag takes precedence.
+If neither is set and this is a remote, interactive run, a menu prompt asks
+(default: no).
 USAGE
 }
 
 REMOTE=""
+DICTATE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -r|--remote) REMOTE="${2:?--remote requires a HOST argument}"; shift 2 ;;
     --remote=*)  REMOTE="${1#*=}"; shift ;;
+    -d|--dictate) DICTATE="1"; shift ;;
     -h|--help)   usage; exit 0 ;;
     *) echo "!! Unknown argument: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
 REMOTE="${REMOTE:-${HANGARBAY_REMOTE:-}}"
+DICTATE="${DICTATE:-${HANGARBAY_DICTATE:-}}"
 
 # If no host was given via flag or env var, offer an interactive choice between
 # running everything locally or targeting a remote Ollama server. A flag/env var
@@ -119,16 +136,18 @@ remote_script() {
   if [[ -n "$REMOTE" ]]; then ssh "$REMOTE" bash -s; else bash -s; fi
 }
 
-# Poll a /api/version endpoint until it answers or we give up, instead of
-# looping forever (a blocked port or a server that never starts would
-# otherwise hang the launcher indefinitely).
+# Poll a URL until it answers or we give up, instead of looping forever (a
+# blocked port or a server that never starts would otherwise hang the
+# launcher indefinitely). mode="soft" returns 1 on timeout instead of exiting
+# — used for optional features (dictation) that should degrade, not abort.
 wait_for_http() {
-  local host="$1" hint="${2:-}" tries=60
-  until curl -sf "http://${host}/api/version" >/dev/null 2>&1; do
+  local url="$1" hint="${2:-}" mode="${3:-hard}" tries=60
+  until curl -sf "$url" >/dev/null 2>&1; do
     tries=$((tries - 1))
     if [[ $tries -le 0 ]]; then
-      echo "!! Timed out waiting for ${host} to answer." >&2
+      echo "!! Timed out waiting for ${url} to answer." >&2
       [[ -n "$hint" ]] && echo "!! $hint" >&2
+      [[ "$mode" == "soft" ]] && return 1
       exit 1
     fi
     sleep 0.5
@@ -161,6 +180,23 @@ PROXY_HOST="127.0.0.1:11435"   # temperature-clamping proxy; always local
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDIT_RULES="$SCRIPT_DIR/hangarbaycc-editing-rules.md"
 TEMP_PROXY="$SCRIPT_DIR/hangarbaycc-proxy.py"
+
+# Voice dictation (optional, remote mode only): whisper-server binds every
+# interface on the GPU host (same posture as Ollama's SERVER_BIND above), the
+# client (this machine) reaches it directly — no proxy involved, since it
+# never touches Claude Code's request path.
+WHISPER_PORT=11436
+if [[ -n "$REMOTE" ]]; then
+  WHISPER_BIND="0.0.0.0:${WHISPER_PORT}"
+  WHISPER_HOST="${REMOTE}:${WHISPER_PORT}"
+else
+  WHISPER_BIND="127.0.0.1:${WHISPER_PORT}"
+  WHISPER_HOST="127.0.0.1:${WHISPER_PORT}"
+fi
+WHISPER_DIR='$HOME/whisper.cpp'   # single-quoted: expanded on the TARGET host
+WHISPER_MODEL="${WHISPER_MODEL:-ggml-small.en-q8_0.bin}"
+WHISPER_MIN_FREE_MIB=1000
+WHISPER_ENDPOINT_FILE="${XDG_RUNTIME_DIR:-/tmp}/hangarbay-whisper-endpoint"
 
 # Small models emit malformed/hallucinated tool calls when too many tools are
 # in context. The temp proxy STRIPS these from the `tools` schema on every
@@ -280,6 +316,20 @@ if [[ "$MODEL" == "qwen2.5-coder:14b" && "$KV_CACHE_TYPE" == "f16" ]]; then
   echo ">>          (near-lossless) if you see garbled or repetitive output." >&2
 fi
 
+# Dictation only makes sense in remote mode (the laptop has no spare VRAM);
+# only ask if it wasn't already decided via flag/env, and only interactively.
+if [[ -z "$DICTATE" && -n "$REMOTE" && -t 0 ]]; then
+  read -rp "Enable voice dictation (whisper-server on ${REMOTE}) [y/N]: " DICTATE_CHOICE
+  case "${DICTATE_CHOICE:-n}" in
+    y|Y) DICTATE="1" ;;
+    *)   DICTATE="" ;;
+  esac
+fi
+if [[ -n "$DICTATE" && -z "$REMOTE" ]]; then
+  echo ">> Dictation requires --remote (the local machine has no spare VRAM budgeted) — ignoring." >&2
+  DICTATE=""
+fi
+
 # Client-side: only OLLAMA_HOST matters in this shell (ollama ps/stop below,
 # and later `ollama launch claude` once repointed at the proxy). The rest are
 # server-only knobs, passed inline to the (possibly remote) `ollama serve`
@@ -307,11 +357,12 @@ echo ">> Starting ollama serve on ${SERVER_LABEL}..."
 remote_script <<EOF
 pkill -x ollama 2>/dev/null || true
 pkill -x llama-server 2>/dev/null || true
+pkill -x whisper-server 2>/dev/null || true
 sleep 2
 OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=$KV_CACHE_TYPE OLLAMA_CONTEXT_LENGTH=$NUM_CTX OLLAMA_HOST=$SERVER_BIND OLLAMA_MODELS=$MODEL_STORE OLLAMA_KEEP_ALIVE=-1 OLLAMA_NUM_PARALLEL=1 setsid nohup ollama serve >/tmp/ollama-hangarbaycc.log 2>&1 </dev/null &
 disown
 EOF
-wait_for_http "$API_HOST" "${REMOTE:+Check the firewall on $REMOTE allows port 11434 from this LAN, and that the server started: ssh $REMOTE tail -20 /tmp/ollama-hangarbaycc.log}"
+wait_for_http "http://${API_HOST}/api/version" "${REMOTE:+Check the firewall on $REMOTE allows port 11434 from this LAN, and that the server started: ssh $REMOTE tail -20 /tmp/ollama-hangarbaycc.log}"
 
 # --- 3. preload and VERIFY it's fully on the GPU before launching Claude Code --
 echo ">> Preloading (allocates the full KV cache)..."
@@ -347,6 +398,42 @@ if [[ -n "$SPILL" ]]; then
 fi
 echo ">> Fully on GPU. Launching Claude Code..."
 
+# --- 3a. optionally start voice dictation (whisper-server) on spare VRAM ------
+# Runs AFTER the spill guard above confirmed the model is 100% on GPU, so
+# whisper only ever takes leftover VRAM — the spill guard above needs no
+# changes to account for it. Every failure here warns and skips dictation;
+# none of them should abort the coding session.
+if [[ -n "$DICTATE" ]]; then
+  if ! remote_exec "test -x ${WHISPER_DIR}/build/bin/whisper-server && test -f ${WHISPER_DIR}/models/${WHISPER_MODEL}"; then
+    echo "!! whisper-server not set up on ${SERVER_LABEL} — run ./setup-whisper-server.sh ${REMOTE} first." >&2
+    echo "!! Continuing without dictation." >&2
+  else
+    FREE_MIB="$(remote_exec "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits" | head -1 | tr -d '[:space:]')"
+    if [[ -z "$FREE_MIB" || "$FREE_MIB" -lt "$WHISPER_MIN_FREE_MIB" ]]; then
+      echo "!! Only ${FREE_MIB:-0} MiB free on ${SERVER_LABEL} after loading ${MODEL}" >&2
+      echo "!! (need ~${WHISPER_MIN_FREE_MIB} MiB for whisper-server) — skipping dictation." >&2
+      echo "!! Pick a smaller context/more compressed KV cache to free headroom." >&2
+    else
+      echo ">> Starting whisper-server on ${SERVER_LABEL} (:${WHISPER_PORT}, ${FREE_MIB} MiB free)..."
+      remote_script <<EOF
+pkill -x whisper-server 2>/dev/null || true
+sleep 1
+cd ${WHISPER_DIR}
+setsid nohup ./build/bin/whisper-server -m models/${WHISPER_MODEL} \
+  --host ${WHISPER_BIND%%:*} --port ${WHISPER_PORT} -t 4 \
+  >/tmp/whisper-hangarbaycc.log 2>&1 </dev/null &
+disown
+EOF
+      if wait_for_http "http://${WHISPER_HOST}/" "Check /tmp/whisper-hangarbaycc.log on ${SERVER_LABEL} — first start JIT-compiles PTX and can take longer than usual." soft; then
+        echo "$WHISPER_HOST" > "$WHISPER_ENDPOINT_FILE"
+        echo ">> Dictation ready: bind a hotkey to $SCRIPT_DIR/hangarbay-dictate.sh (toggle to talk)."
+      else
+        echo "!! whisper-server didn't come up in time — continuing without dictation." >&2
+      fi
+    fi
+  fi
+fi
+
 # --- 3b. start the temperature-clamping proxy and point Claude Code at it ------
 # The proxy transparently forwards to the real server but clamps temperature
 # into the model's band, caps top_p, and strips the DISALLOWED_TOOLS schemas
@@ -359,7 +446,7 @@ if [[ -f "$TEMP_PROXY" ]]; then
   nohup python3 "$TEMP_PROXY" "$PROXY_PORT" "$API_HOST" "$TEMP_FLOOR" "$TEMP_CEIL" \
     "$TOP_P_CEIL" "$STRIP_TOOLS" >/tmp/hangarbaycc-proxy.log 2>&1 &
   disown
-  wait_for_http "$PROXY_HOST" "Check /tmp/hangarbaycc-proxy.log"
+  wait_for_http "http://${PROXY_HOST}/api/version" "Check /tmp/hangarbaycc-proxy.log"
   export OLLAMA_HOST="$PROXY_HOST"
 else
   echo "!! $TEMP_PROXY not found — launching at the model's default temperature." >&2
@@ -396,4 +483,8 @@ if [[ -n "$REMOTE" ]]; then
   echo ">> To restore the system Ollama service on $REMOTE: ssh -t $REMOTE sudo systemctl start ollama"
 else
   echo ">> To restore the system Ollama service: sudo systemctl start ollama"
+fi
+if [[ -n "$DICTATE" ]]; then
+  echo ">> whisper-server on ${SERVER_LABEL} left running too (dictation keeps working)."
+  echo ">> Stop it with: ssh $REMOTE pkill -x whisper-server"
 fi

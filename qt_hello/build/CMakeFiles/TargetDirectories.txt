@@ -1,0 +1,3 @@
+/home/dingo/Programming/hangarbaycc/qt_hello/build/CMakeFiles/qt_hello.dir
+/home/dingo/Programming/hangarbaycc/qt_hello/build/CMakeFiles/edit_cache.dir
+/home/dingo/Programming/hangarbaycc/qt_hello/build/CMakeFiles/rebuild_cache.dir

@@ -112,3 +112,52 @@ For each step, note: did it work as described, or what differed? Particularly
 useful: the exact text of step 4.2 (store line) and 4.6 (proxy upstream line)
 copy-pasted, since those two lines are the clearest proof the remote plumbing
 is actually hitting ml-server and not silently falling back to localhost.
+
+## 9. Voice dictation
+
+Only relevant with `--remote`. Do this after the basic remote-mode checks
+above pass.
+
+1. **Disk check before setup:** `ssh ml-server df -h /` — note free space
+   (ml-server has been observed at ~97% full; the setup script aborts early
+   if free space is under ~3 GB rather than failing mid-build).
+2. **One-time setup:** `./setup-whisper-server.sh ml-server`. Expect: CUDA
+   toolkit found (`nvcc`), a successful `cmake`/build (watch for the Blackwell
+   PTX note — `-DCMAKE_CUDA_ARCHITECTURES=89-virtual`, not a native `sm_120`
+   failure), the model downloaded, and a smoke-test transcript of
+   `samples/jfk.wav` containing "ask not what your country" and a `CUDA`
+   mention in the log.
+3. **Disk check after setup:** `ssh ml-server df -h /` again — confirm the
+   build + model didn't eat an unexpectedly large chunk of the remaining
+   space.
+4. **Launch with dictation:** `./hangarbaycc.sh --remote ml-server --dictate`
+   (or answer `y` at the "Enable voice dictation?" prompt). Watch for, in
+   order, after the existing spill-guard "Fully on GPU" line:
+   - `>> Starting whisper-server on ml-server (:11436, NNNN MiB free)...`
+   - `>> Dictation ready: bind a hotkey to .../hangarbay-dictate.sh ...`
+5. **Verify placement:** `ssh ml-server nvidia-smi` shows both the Ollama
+   runner and `whisper-server` processes, total VRAM well under 16 GB, no
+   spill reported by the launcher.
+6. **Manual round trip (no mic needed):** copy a WAV sample to the laptop and
+   `curl -sf http://ml-server:11436/inference -F file=@sample.wav -F
+   response_format=json` — expect JSON with a `text` field.
+7. **Hotkey end-to-end:** bind `hangarbay-dictate.sh` to a hotkey (or run it
+   directly from a terminal twice). First run: recording-started
+   notification. Speak a sentence. Second run: transcript appears — typed
+   into the focused window if using the default mode, printed with
+   `--stdout`, or copied to the clipboard with `--clipboard`.
+8. **Injection path:** note which of `wtype` / `ydotool` / clipboard-fallback
+   actually fired — GNOME on Wayland is expected to fail `wtype` and need
+   `ydotool` + `ydotoold` running.
+9. **Negative paths:**
+   - Run `hangarbay-dictate.sh` while whisper-server is stopped → immediate
+     "server unreachable" notification, no recording started.
+   - Start and immediately stop (sub-second) → "recording too short" message.
+   - Record silence → "empty transcript" message, nothing typed.
+10. **After exit:** `ssh ml-server pgrep -x whisper-server` → still running
+    (left warm, like Ollama). Confirm the next launch's cleanup step
+    (`pkill -x whisper-server`) reaps it before the new session starts.
+11. **VRAM-skip path:** temporarily set a very high threshold
+    (`WHISPER_MIN_FREE_MIB` in `hangarbaycc.sh`, or load a bigger
+    context/model first) and confirm the launcher warns and skips dictation
+    without aborting the Claude Code session.

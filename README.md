@@ -175,6 +175,73 @@ check the remote host's firewall allows port 11434 from your subnet, and tail
 /tmp/ollama-hangarbaycc.log`). See `.claude/skills/hangarbaycc-doctor/` for a
 fuller checklist — it covers remote-mode log locations too.
 
+## Voice dictation (optional, remote mode only)
+
+Press a hotkey, speak, press it again, and the transcript is typed into
+whatever window is focused (normally the Claude Code TUI) — powered by
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) running on the GPU
+host's spare VRAM. Only available with `--remote` (the laptop has no VRAM
+budget of its own).
+
+**One-time setup** (from the laptop, targets the GPU host over SSH):
+
+```bash
+./setup-whisper-server.sh ml-server
+```
+
+This clones and builds whisper.cpp with CUDA, downloads the `small.en q8_0`
+model (~270 MB file, ~0.6 GB VRAM loaded), and runs a smoke test. On a
+Blackwell card (e.g. RTX 5060 Ti) whose CUDA toolkit predates native `sm_120`
+codegen, it builds with `-DCMAKE_CUDA_ARCHITECTURES=89-virtual` — PTX-only,
+JIT-compiled by the driver at first load (a one-time delay, not a per-request
+cost). If your toolkit is CUDA 12.8+, native `sm_120` codegen works too; the
+script's PTX approach is just the safer default. Disk is often tight on a GPU
+box — the script downloads exactly one model file, never speculatively pulls
+multiple sizes, and aborts early if free space is under ~3 GB.
+
+**Using it:**
+
+```bash
+./hangarbaycc.sh --remote ml-server --dictate
+# or answer 'y' at the interactive "Enable voice dictation?" prompt
+# or: HANGARBAY_DICTATE=1 ./hangarbaycc.sh --remote ml-server
+```
+
+The launcher starts `whisper-server` on the GPU host **after** confirming the
+main model is 100% on GPU (never before — so dictation can only ever use
+leftover VRAM, and the existing spill guard needs no changes to account for
+it). If there isn't enough free VRAM (default threshold: 1000 MiB), it warns
+and skips dictation rather than aborting the coding session.
+
+Bind `hangarbay-dictate.sh` to a hotkey in your desktop environment (GNOME:
+Settings → Keyboard → Custom Shortcuts; Sway/i3: a `bindsym`/`bindkey` line
+running the script). First press starts recording; second press stops it,
+sends the audio to whisper-server, and types the result:
+
+```bash
+hangarbay-dictate.sh                  # type into the focused window (default)
+hangarbay-dictate.sh --stdout         # print the transcript instead
+hangarbay-dictate.sh --clipboard      # copy it instead (wl-copy)
+```
+
+**Text injection caveat:** the default typing path tries `wtype` first, then
+falls back to `ydotool`. GNOME's Wayland compositor (Mutter) does not
+implement the virtual-keyboard protocol `wtype` needs, so on GNOME you'll
+need `ydotool` — install it, start the `ydotoold` daemon, and make sure your
+user can access `/dev/uinput` (an `input` group + udev rule, or run
+`ydotoold` as a systemd service). If neither works, the transcript is copied
+to the clipboard instead so nothing is lost.
+
+**Security note:** like Ollama, `whisper-server` binds `0.0.0.0:11436` while
+a dictation-enabled session runs — reachable, unauthenticated, by anything on
+that LAN. Same trust posture as the rest of remote mode: fine on a trusted
+home network, or point at a Tailscale IP for narrower reachability.
+
+Left running on exit, same as Ollama (so the model stays warm and the JIT
+cost isn't paid again); the next launch's cleanup step kills any stale
+instance before starting a fresh one. Stop it by hand with:
+`ssh ml-server pkill -x whisper-server`.
+
 ## Dependencies
 
 Everything the launcher shells out to. On a single-machine setup all of these
@@ -194,6 +261,10 @@ the GPU host (server) as noted.
 - **`curl`** — health checks and the preload probe.
 - **`ssh`** — only for `--remote` (key-based auth strongly preferred; a launch
   makes several separate SSH calls).
+- **For dictation only:** one of `pw-record` (pipewire-utils), `parecord`, or
+  `arecord` to capture the mic; `wtype` and/or `ydotool` (+ `ydotoold`
+  running) to type the transcript; optionally `wl-copy` (wl-clipboard) and
+  `notify-send` for the clipboard fallback and status notifications.
 
 **On the machine that hosts the model (server — the same box locally, or the
 `--remote` host):**
@@ -204,6 +275,10 @@ the GPU host (server) as noted.
   `/var/lib/ollama/models` or `~/.ollama/models`.
 - **`sudo`** — only if the systemd `ollama` service is normally active, to
   stop/restart it around the session.
+- **For dictation only:** `git`, `cmake`, `gcc`/`g++`, and a CUDA **toolkit**
+  (`nvcc` — Ollama bundles its own CUDA runtime and doesn't need this, so
+  it's the one new build-time dependency); ~1–2 GB free disk under
+  `~/whisper.cpp` for the build and model.
 
 **For the benchmark (`bench/`) only:**
 - **`gcc` / `g++`** — the bench compiles and runs the C/C++ tasks to score them.
