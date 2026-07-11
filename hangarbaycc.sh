@@ -239,8 +239,9 @@ build_launch_settings() {
 # temp=1.0 on every request; the proxy clamps it into [TEMP_FLOOR, TEMP_CEIL].
 # A single low value keeps tool calls clean but makes a small model loop; a band
 # keeps enough entropy to escape agentic repetition loops. gpt-oss is the
-# exception: its recommended sampling IS temp 1.0 / top_p 1.0, so its band is
-# 0.9-1.0 and the clamp is effectively a no-op.
+# exception: its recommended sampling is temp 1.0 / top_p 1.0, but 1.0 produced
+# imprecise Edit old_strings in long sessions (2026-07-11), so it is pinned at
+# the band floor 0.90 — the low end of its recommended range.
 echo "Select model:   (see fit table in header; the preload guard verifies fit)"
 echo "  1) ornith:latest         9B,  5.6 GB weights, full 256K context (bench: 4/8)"
 echo "  2) gemma4:latest         8B Q4_K_M, max 128K context"
@@ -251,7 +252,7 @@ case "$MODEL_CHOICE" in
   1) MODEL="ornith:latest"     MAX_CTX=262144 TEMP_FLOOR=0.55 TEMP_CEIL=0.70 TOP_P_CEIL=0.95 ;;
   2) MODEL="gemma4:latest"     MAX_CTX=131072 TEMP_FLOOR=0.55 TEMP_CEIL=0.70 TOP_P_CEIL=0.95 ;;
   3) MODEL="qwen2.5-coder:14b" MAX_CTX=32768  TEMP_FLOOR=0.55 TEMP_CEIL=0.70 TOP_P_CEIL=0.95 ;;
-  4) MODEL="gpt-oss:20b"       MAX_CTX=131072 TEMP_FLOOR=0.90 TEMP_CEIL=1.00 TOP_P_CEIL=1.00 ;;
+  4) MODEL="gpt-oss:20b"       MAX_CTX=131072 TEMP_FLOOR=0.90 TEMP_CEIL=0.90 TOP_P_CEIL=1.00 ;;
   *) echo "!! Invalid model choice: $MODEL_CHOICE" >&2; exit 1 ;;
 esac
 

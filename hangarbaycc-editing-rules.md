@@ -5,7 +5,7 @@ to spawn subagents or fetch the web — those tools are not available here.
 
 ## Prefer Write over Edit
 
-For any file under ~150 lines, DO NOT use Edit. Instead: Read the whole file,
+For any file under ~400 lines, DO NOT use Edit. Instead: Read the whole file,
 then call **Write** with the complete new file contents, including your change.
 A full rewrite has no `old_string` to match, so it cannot fail on a mismatch.
 
