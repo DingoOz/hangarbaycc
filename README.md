@@ -122,6 +122,47 @@ gpt-oss. See `.claude/skills/hangarbaycc-bench/` — in a cloud Claude Code
 session in this repo, `/hangarbaycc-bench` runs it and `/hangarbaycc-doctor`
 diagnoses a bad session from the logs.
 
+## Example prompts
+
+Five prompts to try once a session is up, grounded in what's actually in this
+repo — good for seeing what the local model (or Claude) actually produces,
+with visual output where possible.
+
+**1. Instant visual wow (single-shot HTML artifact)**
+> Build a complete, playable Breakout clone as a single self-contained HTML
+> file (canvas, no external libraries) — paddle physics with angle-based
+> bounce, brick grid, lives, pause, win/lose states.
+
+**2. Generative art / physics (single-shot HTML artifact)**
+> Build an interactive particle-flocking simulation (boids) in a single HTML
+> canvas file — mouse acts as an attractor/repeller, particles leave a subtle
+> motion trail, color-by-velocity gradient.
+
+**3. Fix + extend the real codebase (native SDL2 window)**
+> app/src/main.cpp fails to compile — there's a nested function definition
+> inside main() that's invalid C++. Fix the build, then add a particle-burst
+> effect when the smart bomb (GameState.hpp) clears enemies. Build and run it.
+
+**4. Put the dormant raylib dependency to work (native OpenGL window)**
+> platform/CMakeLists.txt already fetches raylib 5.0 but platform.cpp/
+> platform.hpp are empty stubs. Implement them to open a raylib window
+> rendering a bouncing, colliding ball swarm with gravity and elastic
+> collisions. Build and run it.
+
+**5. `/ralph-loop` — autonomous local-model refinement**
+```
+/ralph-loop Build the Breakout clone described in breakout-benchmark.md.
+Score yourself against the rubric in that file after each pass and keep
+improving until every checklist item passes. --max-iterations 6
+--completion-promise "BREAKOUT BENCHMARK PASSED"
+```
+Publish each pass's HTML output as an artifact to see the model refine its
+own code iteration over iteration.
+
+Bonus: `/loop 20m /hangarbaycc-bench`, then ask for the running results as an
+artifact bar chart comparing model pass rates over time — less "pretty
+graphics," more "the benchmarking harness itself is the show."
+
 ## Usage
 
 ```bash
