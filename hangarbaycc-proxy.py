@@ -68,12 +68,14 @@ Usage:
     hangarbaycc-proxy.py [LISTEN_PORT] [UPSTREAM_HOSTPORT] [TEMP_FLOOR] [TEMP_CEIL]
                          [TOP_P_CEIL] [STRIP_TOOLS] [PROTOCOL] [CLASSIFIER_MODEL]
                          [CLASSIFIER_UPSTREAM] [CLASSIFIER_TRIGGER_MODEL]
-Defaults: 11435  127.0.0.1:11434  0.55  0.70  0.95  ""  ollama  ""  127.0.0.1:11434  claude-sonnet-5
+                         [CLASSIFIER_NUM_GPU]
+Defaults: 11435  127.0.0.1:11434  0.55  0.70  0.95  ""  ollama  ""  127.0.0.1:11434  claude-sonnet-5  0
 """
 import http.client
 import json
 import re
 import sys
+import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -123,6 +125,48 @@ FINISH_REASON_MAP = {"stop": "end_turn", "tool_calls": "tool_use", "length": "ma
 CLASSIFIER_MODEL = sys.argv[8] if len(sys.argv) > 8 else ""
 CLASSIFIER_UPSTREAM = sys.argv[9] if len(sys.argv) > 9 else "127.0.0.1:11434"
 CLASSIFIER_TRIGGER_MODEL = sys.argv[10] if len(sys.argv) > 10 else "claude-sonnet-5"
+CLASSIFIER_NUM_GPU = int(sys.argv[11]) if len(sys.argv) > 11 else 0
+
+# options.num_gpu for the classifier's Ollama requests — only exists on
+# Ollama's NATIVE /api/chat, not the Anthropic-compat /v1/messages
+# passthrough, so classifier requests get translated to Ollama-native shape
+# (see to_ollama_native_request / ollama_native_to_anthropic_response)
+# rather than just passed through. Historically forced to 0 (CPU-only)
+# because CLASSIFIER_UPSTREAM was ml-server, whose GPU is already ~full with
+# mesh-llm's own layers (331-336 MiB free of 16 GB) — a second model loading
+# there via GPU reliably OOMs, even for tiny requests (Ollama sizes the
+# KV-cache allocation off num_ctx, not the actual prompt size). A dedicated
+# classifier host with its own free GPU (e.g. gtx1070) should instead pass
+# -1 here (let Ollama use the GPU) via hangarbaycc.sh's CLASSIFIER_NUM_GPU.
+#
+# CPU prefill is nowhere near GPU speed, though: live-measured ~180-215
+# tok/s on ml-server's 12 cores for this model, so a 20K-token prompt (our
+# first attempt at a trim budget) took over 2 minutes and timed out outright
+# — the classifier needs to answer in single-digit seconds to be useful at
+# all. CLASSIFIER_NUM_CTX is just the KV-cache allocation ceiling (cheap,
+# RAM is plentiful); CLASSIFIER_CONTEXT_BUDGET_BYTES below is what actually
+# controls latency, by bounding how many tokens get prefilled per call.
+CLASSIFIER_NUM_CTX = 32768
+
+# The classifier request's own context (system + full message history Claude
+# Code sends it) grows with the conversation just like the main turn's does —
+# live-observed reaching ~121KB (~30K tokens). Trimmed aggressively: drop the
+# OLDEST messages first, always keeping the last one (the actual action
+# being judged) and the system prompt (the auto-mode rules — needed to judge
+# anything at all). ~8KB keeps CPU prefill to single-digit seconds
+# (live-measured: ~2.5KB->3.9s, ~6KB->7.1s, ~12KB->15.4s — roughly linear).
+CLASSIFIER_CONTEXT_BUDGET_BYTES = 8_000
+
+# meshllm processes one request at a time and instantly rejects (429/404,
+# 0.0s — it doesn't queue) anything that arrives while it's busy. Claude Code
+# routinely fires more than one request at once (e.g. a small side-request
+# for conversation-title generation alongside the main turn), so without
+# this lock the loser of that race gets 429'd and retried into a storm —
+# live-observed: a 32s main-turn request in flight, three consecutive 429s
+# for a second request over that same window. Only guards the meshllm leg
+# (PROTOCOL=="openai"); the classifier goes to a different host and doesn't
+# contend with meshllm, and Ollama-protocol mode has never shown this issue.
+UPSTREAM_LOCK = threading.Lock()
 
 # Headers that must not be copied between hops.
 HOP_BY_HOP = {
@@ -189,6 +233,99 @@ def rewrite_body(body: bytes) -> bytes:
         changed = True
 
     return json.dumps(data).encode("utf-8") if changed else body
+
+
+def _truncate_text(s: str, max_chars: int) -> str:
+    if not isinstance(s, str) or len(s) <= max_chars:
+        return s
+    marker = f"\n...[truncated {len(s) - max_chars} chars]...\n"
+    return s[: max_chars // 2] + marker + s[-max_chars // 2 :]
+
+
+def _truncate_content(content, max_chars: int):
+    """content is either a plain string or a list of Anthropic content
+    blocks — truncate whatever text is in there, in place-equivalent
+    (returns a new value, doesn't mutate)."""
+    if isinstance(content, str):
+        return _truncate_text(content, max_chars)
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if not isinstance(b, dict):
+                out.append(b)
+                continue
+            b = dict(b)
+            if isinstance(b.get("text"), str):
+                b["text"] = _truncate_text(b["text"], max_chars)
+            if isinstance(b.get("content"), str):  # tool_result content
+                b["content"] = _truncate_text(b["content"], max_chars)
+            out.append(b)
+        return out
+    return content
+
+
+def _trim_for_classifier_context(data: dict) -> dict:
+    """Fit the request under CLASSIFIER_CONTEXT_BUDGET_BYTES so a growing
+    conversation never exceeds the classifier model's own (much smaller than
+    meshllm's) context, in three escalating steps — most requests only need
+    the first:
+      1. Drop the oldest messages, keeping system + the last message (the
+         actual action being judged).
+      2. If system + the remaining message(s) alone still exceed budget
+         (live-observed: a single Edit/Write judgment can embed an entire
+         file's contents, or the system prompt itself can be large — dropping
+         messages alone doesn't help either case), truncate the system prompt.
+      3. If STILL over budget, truncate each remaining message's content too.
+    No-op if already under budget."""
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return data
+
+    def _size(sys_val, msgs) -> int:
+        return len(json.dumps({"system": sys_val, "messages": msgs, "tools": data.get("tools")}))
+
+    system = data.get("system")
+    if _size(system, messages) <= CLASSIFIER_CONTEXT_BUDGET_BYTES:
+        return data
+
+    trimmed = list(messages)
+    dropped = 0
+    while len(trimmed) > 1 and _size(system, trimmed) > CLASSIFIER_CONTEXT_BUDGET_BYTES:
+        trimmed.pop(0)
+        dropped += 1
+    if dropped:
+        log(f"classifier request trimmed: dropped {dropped} oldest message(s)")
+
+    if _size(system, trimmed) > CLASSIFIER_CONTEXT_BUDGET_BYTES:
+        # `system` can be a plain string OR an array of content blocks — a
+        # per-block cap (like message content gets below) could still leave
+        # the total oversized if there are many blocks, since each one gets
+        # capped independently, not the sum. Flatten to one string and
+        # hard-cap THAT instead, which bounds the total regardless of the
+        # original structure. (An earlier string-only truncation attempt
+        # silently no-op'd on the array case, which is what Claude Code's
+        # real auto-mode system prompt turned out to be — live-observed:
+        # logged before==after size, still 109882B.)
+        before = len(json.dumps(system)) if system else 0
+        system = _truncate_text(_flatten_text(system), CLASSIFIER_CONTEXT_BUDGET_BYTES // 2)
+        log(f"classifier request trimmed: system prompt {before}B -> "
+            f"{len(json.dumps(system)) if system else 0}B (still over budget after dropping messages)")
+
+    if _size(system, trimmed) > CLASSIFIER_CONTEXT_BUDGET_BYTES:
+        per_msg_cap = max(500, CLASSIFIER_CONTEXT_BUDGET_BYTES // max(1, len(trimmed)) // 2)
+        trimmed = [{**m, "content": _truncate_content(m.get("content"), per_msg_cap)}
+                   if isinstance(m, dict) else m for m in trimmed]
+        log(f"classifier request trimmed: message content capped at ~{per_msg_cap} chars each "
+            f"(still over budget after dropping messages + system)")
+
+    final_size = _size(system, trimmed)
+    if final_size > CLASSIFIER_CONTEXT_BUDGET_BYTES:
+        log(f"classifier request still {final_size}B after all trimming "
+            f"(budget {CLASSIFIER_CONTEXT_BUDGET_BYTES}B) — proceeding anyway, may be slow")
+
+    data["system"] = system
+    data["messages"] = trimmed
+    return data
 
 
 # --- Anthropic Messages <-> OpenAI Chat Completions translation (PROTOCOL=openai) ---
@@ -342,6 +479,89 @@ def to_anthropic_response(resp: dict, requested_model: str) -> dict:
         "usage": {"input_tokens": usage.get("prompt_tokens", 0),
                    "output_tokens": usage.get("completion_tokens", 0)},
     }
+
+
+def to_ollama_native_request(data: dict) -> dict:
+    """Anthropic-shaped (already rewrite_body()/_trim_for_classifier_context()
+    processed) -> Ollama's native /api/chat shape. Reuses to_openai_request's
+    message/system flattening (nearly identical shape — role/content pairs);
+    the meaningful differences are the top-level `options` object (used here
+    to set CLASSIFIER_NUM_GPU — 0 to force CPU-only when the classifier host's
+    GPU has no headroom, -1 to let Ollama use the GPU on a dedicated host) and
+    always requesting non-streaming (classifier replies are a few
+    tokens; simpler to always block briefly than handle Ollama's differently-
+    framed streaming format for something this size — see _relay_classifier
+    for how a client's own `stream:true` request is still honored on the way
+    back out, synthesized from this single blocking call).
+
+    keep_alive is set on EVERY call, not just hangarbaycc.sh's one-time
+    startup preload — Ollama's keep_alive is refreshed per-request, so
+    without this every proxied call after the first would fall back to
+    Ollama's own (much shorter) default, undoing the preload's setting and
+    causing an unexpected cold reload mid-session (live-observed: `ollama ps`
+    showed nothing loaded well into an active session, and the next call hit
+    a cold-load-plus-prefill penalty that exceeded the classifier's request
+    timeout). llama3.2:3b is small (~2 GB) enough that keeping it loaded for
+    the session's duration is a fine tradeoff — "-1" here, not a bounded
+    duration like hangarbaycc.sh used for the previous, much larger 14B
+    classifier model."""
+    openai_shaped = to_openai_request(data)
+    return {
+        "model": openai_shaped["model"],
+        "messages": openai_shaped["messages"],
+        "stream": False,
+        "keep_alive": -1,
+        "options": {"num_gpu": CLASSIFIER_NUM_GPU, "num_ctx": CLASSIFIER_NUM_CTX,
+                    "num_predict": openai_shaped.get("max_tokens", MIN_MAX_TOKENS)},
+    }
+
+
+def ollama_native_to_anthropic_response(resp: dict, requested_model: str) -> dict:
+    """Ollama /api/chat (non-streaming) response -> Anthropic Messages response."""
+    message = resp.get("message") or {}
+    text = message.get("content") or ""
+    stop_reason = {"stop": "end_turn", "length": "max_tokens"}.get(
+        resp.get("done_reason"), "end_turn")
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message", "role": "assistant", "model": requested_model,
+        "content": [{"type": "text", "text": text}] if text else [],
+        "stop_reason": stop_reason, "stop_sequence": None,
+        "usage": {"input_tokens": resp.get("prompt_eval_count", 0),
+                   "output_tokens": resp.get("eval_count", 0)},
+    }
+
+
+def _single_shot_anthropic_sse(anth: dict):
+    """A complete non-streaming Anthropic response -> the minimal correct
+    Anthropic SSE event sequence for it (one text block, no incremental
+    deltas beyond the one chunk we actually have). Used only for classifier
+    replies that request streaming — real streaming isn't worth building for
+    a handful of tokens, but the response still needs to be valid SSE if the
+    caller asked for it."""
+    def sse(event, data):
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+
+    usage = anth.get("usage") or {}
+    yield sse("message_start", {"type": "message_start", "message": {
+        "id": anth["id"], "type": "message", "role": "assistant",
+        "model": anth["model"], "content": [],
+        "stop_reason": None, "stop_sequence": None,
+        "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": 1}}})
+
+    text = "".join(b.get("text", "") for b in anth.get("content", [])
+                    if isinstance(b, dict) and b.get("type") == "text")
+    if text:
+        yield sse("content_block_start", {"type": "content_block_start",
+            "index": 0, "content_block": {"type": "text", "text": ""}})
+        yield sse("content_block_delta", {"type": "content_block_delta",
+            "index": 0, "delta": {"type": "text_delta", "text": text}})
+        yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+
+    yield sse("message_delta", {"type": "message_delta",
+        "delta": {"stop_reason": anth.get("stop_reason", "end_turn"), "stop_sequence": None},
+        "usage": {"output_tokens": usage.get("output_tokens", 1)}})
+    yield sse("message_stop", {"type": "message_stop"})
 
 
 def _openai_error_to_anthropic(status: int, raw_body: bytes) -> dict:
@@ -556,9 +776,9 @@ class Proxy(BaseHTTPRequestHandler):
         # Auto-mode classifier requests (named CLASSIFIER_TRIGGER_MODEL, e.g.
         # Claude Code's hardcoded "claude-sonnet-5" default) get their `model`
         # field rewritten to CLASSIFIER_MODEL and are routed to the
-        # classifier's own upstream via plain passthrough, regardless of
-        # PROTOCOL — checked first so it pre-empts the openai translation
-        # path below.
+        # classifier's own upstream via Ollama's NATIVE /api/chat (to force
+        # num_gpu=0 — see CLASSIFIER_NUM_CTX's comment) — checked first so it
+        # pre-empts the openai translation path below.
         if is_gen and CLASSIFIER_MODEL:
             try:
                 data = json.loads(body)
@@ -566,8 +786,8 @@ class Proxy(BaseHTTPRequestHandler):
                 data = None
             if isinstance(data, dict) and data.get("model") == CLASSIFIER_TRIGGER_MODEL:
                 data["model"] = CLASSIFIER_MODEL
-                body = json.dumps(data).encode("utf-8")
-                return self._relay_generic(body, len(body), CLASSIFIER_UPSTREAM, is_gen)
+                data = _trim_for_classifier_context(data)
+                return self._relay_classifier(data, length)
 
         if is_gen and PROTOCOL == "openai":
             return self._relay_openai(body, length)
@@ -625,6 +845,97 @@ class Proxy(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _relay_classifier(self, data: dict, length: int):
+        """Auto-mode classifier path: translate the (already model-rewritten,
+        context-trimmed) Anthropic request to Ollama-native /api/chat, force
+        CPU (num_gpu=0 — see CLASSIFIER_NUM_CTX's comment for why), and
+        translate the response back. Always calls Ollama non-streaming
+        (classifier replies are a handful of tokens — not worth handling
+        Ollama's own streaming line-framing for this); if the ORIGINAL
+        request asked for stream:true, synthesizes a minimal single-shot
+        Anthropic SSE sequence from the one blocking response instead of
+        real incremental streaming."""
+        requested_model = data.get("model") or "unknown"
+        want_streaming = bool(data.get("stream"))
+        ollama_body = json.dumps(to_ollama_native_request(data)).encode("utf-8")
+
+        # Short timeout on purpose: this is a safety classifier, not the main
+        # conversation — if trimming somehow still leaves it too large to
+        # answer quickly, failing fast (and falling back to Claude Code's own
+        # "continue with other tasks" degradation) beats blocking the whole
+        # session for minutes. Live-measured normal (warm) case is well under
+        # 1s; 45s leaves headroom for an occasional cold reload (keep_alive=-1
+        # in to_ollama_native_request should make that rare, but ml-server
+        # restarting or the model getting evicted some other way isn't ruled
+        # out) without going back to the original 120s that caused the
+        # multi-minute stalls this whole area of the code exists to avoid.
+        conn = http.client.HTTPConnection(CLASSIFIER_UPSTREAM, timeout=45)
+        t0 = time.time()
+        status = None
+        stop_reason = None
+        saw_content = False
+        resp_bytes = 0
+        try:
+            conn.request("POST", "/api/chat", body=ollama_body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            status = resp.status
+            raw = resp.read()
+            resp_bytes = len(raw)
+
+            if status != 200:
+                payload = json.dumps(_openai_error_to_anthropic(status, raw)).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                stop_reason = f"http_{status}"
+            else:
+                try:
+                    ollama_json = json.loads(raw)
+                except (ValueError, UnicodeDecodeError):
+                    ollama_json = None
+                if not isinstance(ollama_json, dict) or "message" not in ollama_json:
+                    payload = json.dumps(_openai_error_to_anthropic(200, raw)).encode("utf-8")
+                    self.send_response(502)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    stop_reason = "malformed_upstream"
+                else:
+                    anth = ollama_native_to_anthropic_response(ollama_json, requested_model)
+                    saw_content = bool(anth.get("content"))
+                    stop_reason = anth.get("stop_reason")
+                    if not want_streaming:
+                        payload = json.dumps(anth).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+                        for frame in _single_shot_anthropic_sse(anth):
+                            self.wfile.write(b"%X\r\n%s\r\n" % (len(frame), frame))
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+        except Exception as exc:  # classifier upstream died; best-effort close
+            log(f"relay error on {self.command} {self.path} "
+                f"(status={status}, {resp_bytes}B relayed): {exc}")
+        finally:
+            conn.close()
+
+        note = "" if saw_content else "  <-- EMPTY RESPONSE (no content block)"
+        classifier_mode = "native-cpu" if CLASSIFIER_NUM_GPU == 0 else "native-gpu"
+        log(f"POST {self.path} -> {status} {time.time() - t0:.1f}s "
+            f"req={length}B resp={resp_bytes}B stop={stop_reason}{note} "
+            f"upstream={CLASSIFIER_UPSTREAM} classifier={classifier_mode}")
+
     def _relay_openai(self, body: bytes, length: int):
         """PROTOCOL=openai path for POST /v1/messages: translate Anthropic ->
         OpenAI, forward to UPSTREAM/v1/chat/completions, translate the
@@ -650,73 +961,78 @@ class Proxy(BaseHTTPRequestHandler):
         stop_reason = None
         saw_content = False
         resp_bytes = 0
-        try:
-            conn.request("POST", "/v1/chat/completions", body=openai_body, headers=headers)
-            resp = conn.getresponse()
-            status = resp.status
+        # Held for the FULL request+response cycle (including draining a
+        # streamed response) — meshllm is busy with this client that whole
+        # time, and needs other requests to wait their turn rather than race
+        # in and get instantly 429'd. See UPSTREAM_LOCK's module-level comment.
+        with UPSTREAM_LOCK:
+            try:
+                conn.request("POST", "/v1/chat/completions", body=openai_body, headers=headers)
+                resp = conn.getresponse()
+                status = resp.status
 
-            if status != 200:
-                raw = resp.read()
-                resp_bytes = len(raw)
-                payload = json.dumps(_openai_error_to_anthropic(status, raw)).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-                stop_reason = f"http_{status}"
-
-            elif not streaming:
-                raw = resp.read()
-                resp_bytes = len(raw)
-                try:
-                    upstream_json = json.loads(raw)
-                except (ValueError, UnicodeDecodeError):
-                    upstream_json = None
-                if not isinstance(upstream_json, dict) or "choices" not in upstream_json:
-                    payload = json.dumps(_openai_error_to_anthropic(200, raw)).encode("utf-8")
-                    self.send_response(502)
+                if status != 200:
+                    raw = resp.read()
+                    resp_bytes = len(raw)
+                    payload = json.dumps(_openai_error_to_anthropic(status, raw)).encode("utf-8")
+                    self.send_response(status)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
-                    stop_reason = "malformed_upstream"
+                    stop_reason = f"http_{status}"
+
+                elif not streaming:
+                    raw = resp.read()
+                    resp_bytes = len(raw)
+                    try:
+                        upstream_json = json.loads(raw)
+                    except (ValueError, UnicodeDecodeError):
+                        upstream_json = None
+                    if not isinstance(upstream_json, dict) or "choices" not in upstream_json:
+                        payload = json.dumps(_openai_error_to_anthropic(200, raw)).encode("utf-8")
+                        self.send_response(502)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        stop_reason = "malformed_upstream"
+                    else:
+                        anth = to_anthropic_response(upstream_json, requested_model)
+                        saw_content = bool(anth.get("content"))
+                        stop_reason = anth.get("stop_reason")
+                        payload = json.dumps(anth).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload)
+
                 else:
-                    anth = to_anthropic_response(upstream_json, requested_model)
-                    saw_content = bool(anth.get("content"))
-                    stop_reason = anth.get("stop_reason")
-                    payload = json.dumps(anth).encode("utf-8")
                     self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(payload)))
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Transfer-Encoding", "chunked")
                     self.end_headers()
-                    self.wfile.write(payload)
-
-            else:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Transfer-Encoding", "chunked")
-                self.end_headers()
-                translator = AnthropicStreamTranslator(requested_model, input_tokens_estimate)
-                while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
-                    resp_bytes += len(chunk)
-                    for frame in translator.feed(chunk):
+                    translator = AnthropicStreamTranslator(requested_model, input_tokens_estimate)
+                    while True:
+                        chunk = resp.read(4096)
+                        if not chunk:
+                            break
+                        resp_bytes += len(chunk)
+                        for frame in translator.feed(chunk):
+                            self.wfile.write(b"%X\r\n%s\r\n" % (len(frame), frame))
+                        self.wfile.flush()
+                    for frame in translator.finish():
                         self.wfile.write(b"%X\r\n%s\r\n" % (len(frame), frame))
+                    self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
-                for frame in translator.finish():
-                    self.wfile.write(b"%X\r\n%s\r\n" % (len(frame), frame))
-                self.wfile.write(b"0\r\n\r\n")
-                self.wfile.flush()
-                saw_content = translator.saw_content
-                stop_reason = translator.stop_reason
-        except Exception as exc:  # upstream died mid-stream; best-effort close
-            log(f"relay error on {self.command} {self.path} "
-                f"(status={status}, {resp_bytes}B relayed): {exc}")
-        finally:
-            conn.close()
+                    saw_content = translator.saw_content
+                    stop_reason = translator.stop_reason
+            except Exception as exc:  # upstream died mid-stream; best-effort close
+                log(f"relay error on {self.command} {self.path} "
+                    f"(status={status}, {resp_bytes}B relayed): {exc}")
+            finally:
+                conn.close()
 
         note = "" if saw_content else "  <-- EMPTY RESPONSE (no content block)"
         log(f"POST {self.path} -> {status} {time.time() - t0:.1f}s "

@@ -158,6 +158,29 @@ wait_for_http() {
   done
 }
 
+# --- helpers for running a command on a target host (local, or over SSH) ----
+# Shared by the Ollama --remote backend (main model host) and the meshllm
+# backend's classifier host — each passes its own host as the first arg, "" for
+# local. Simple one-shot command, no pty (fine for anything that doesn't need a
+# terminal, e.g. a health check).
+remote_exec() {
+  local host="$1" cmd="$2"
+  if [[ -n "$host" ]]; then ssh "$host" "$cmd"; else bash -c "$cmd"; fi
+}
+# Same, but allocates a pty — needed for an interactive sudo password prompt.
+remote_exec_tty() {
+  local host="$1" cmd="$2"
+  if [[ -n "$host" ]]; then ssh -t "$host" "$cmd"; else bash -c "$cmd"; fi
+}
+# Multi-line script fed over stdin instead of as a quoted argument — avoids
+# quoting hell when a script mixes values already known here (interpolated
+# before sending) with variables meant to be evaluated on the target host
+# (escaped as \$foo so they survive to the far end literally).
+remote_script() {
+  local host="$1"
+  if [[ -n "$host" ]]; then ssh "$host" bash -s; else bash -s; fi
+}
+
 # `ollama launch claude` sets CLAUDE_CODE_SUBAGENT_MODEL to EMPTY. Claude's logic
 # is: if the var is set and != "inherit", use it; otherwise fall back to a default
 # 'sonnet' alias — which a local/meshllm backend cannot serve, so every spawned
@@ -218,43 +241,91 @@ if [[ "$BACKEND" == "meshllm" ]]; then
   # replies) blows past whatever short timeout the classifier expects anyway
   # — so Claude Code can't safety-check (and therefore can't run) Bash at
   # all. The proxy (see hangarbaycc-proxy.py's CLASSIFIER_* args) detects any
-  # request naming "claude-sonnet-5", rewrites it to CLASSIFIER_MODEL, and
-  # routes it to a small local Ollama model instead — warm latency ~2-3s for
-  # a short reply, vastly more reliable than meshllm for this purpose.
-  # Best-effort: if the local Ollama server isn't reachable or the pull
-  # fails, warn and continue without a classifier override rather than
-  # aborting the whole session (the original behavior — classifier calls
-  # erroring against meshllm — still applies, so Bash/Edit/Write may be
-  # unreliable, but read-only work still functions).
-  # Runs on ml-server (LAN, already hosts the coding-model Ollama store) rather
-  # than this laptop: same ~2-3s warm latency as a tiny local model, but with
-  # a real 14B instruct model's judgment (live-tested: correctly says "No" to
-  # `rm -rf /`, where a 0.5B model wrongly said it was safe — see project
-  # memory/discussion). ml-server's GPU is already ~full with mesh-llm's own
-  # layers (331 MiB free of 16 GB), so this runs CPU-only there too — its 12
-  # cores are just enough faster than this laptop's to match the tiny model's
-  # latency. No pull needed, it's already in ml-server's store. keep_alive is
-  # bounded (30m), NOT indefinite — ml-server is a shared host also running
-  # mesh-llm itself, and this model is ~9 GB; squatting on that RAM forever
-  # after the session ends would be inconsiderate of a resource other things
-  # depend on.
-  CLASSIFIER_MODEL="qwen2.5:14b-instruct-q4_K_M"
-  CLASSIFIER_HOST="192.168.1.16:11434"  # ml-server, same LAN host as meshllm's mesh-llm process
-  if curl -sf -m 5 "http://${CLASSIFIER_HOST}/api/version" >/dev/null; then
+  # request naming "claude-sonnet-5", rewrites it to CLASSIFIER_MODEL, trims
+  # its context (it grows with the conversation just like the main turn's
+  # does), and routes it to Ollama's NATIVE /api/chat on the classifier host
+  # (see below). llama3.2:3b (~2 GB) balances judgment quality against
+  # prefill speed — live-tested: correctly says "No" to `rm -rf /` (a 0.5B
+  # model wrongly said it was safe; a 14B model was fine on judgment but too
+  # slow once its request grew past a few KB on CPU — a bigger model only
+  # makes the latency problem worse there, not better). Best-effort: if the
+  # classifier host isn't reachable/set up or the pull fails, warn and
+  # continue without a classifier override rather than aborting the whole
+  # session (auto-mode Bash/Edit/Write checks may be slow/unreliable, but
+  # read-only work still functions).
+  #
+  # keep_alive=-1 (indefinite), not a bounded duration: Ollama refreshes
+  # keep_alive on every request, so this preload's setting only matters until
+  # the FIRST real classifier call goes through the proxy — after that,
+  # hangarbaycc-proxy.py's own to_ollama_native_request() sets it on every
+  # call, which is what actually keeps it loaded for the session. Both need
+  # to agree, or the model unloads between the preload and first real use.
+  # llama3.2:3b's ~2 GB footprint makes squatting on the classifier host's
+  # RAM/VRAM for the session's duration a fine tradeoff (unlike the much
+  # larger 14B classifier model tried earlier, which used a bounded 30m
+  # specifically to avoid this).
+  #
+  # Runs on gtx1070, a dedicated GPU host (~8 GB, nothing else loaded) —
+  # NOT ml-server, whose GPU is already ~full with mesh-llm's own layers.
+  # Being dedicated, the classifier can use the GPU here (CLASSIFIER_NUM_GPU
+  # below) instead of the CPU-forced fallback ml-server needed. Unlike
+  # ml-server (an always-on box we just reach over the LAN), gtx1070 isn't
+  # assumed to be running Ollama already, so ensure_classifier_server below
+  # installs it on first use and (re)starts `ollama serve` bound to
+  # 0.0.0.0:11434 each launch.
+  CLASSIFIER_MODEL="llama3.2:3b"
+  CLASSIFIER_SSH_HOST="gtx1070"
+  CLASSIFIER_HOST="${CLASSIFIER_SSH_HOST}:11434"
+  CLASSIFIER_NUM_GPU=-1   # -1 = let Ollama use the GPU (dedicated host, no other model resident)
+
+  ensure_classifier_server() {
+    if curl -sf -m 5 "http://${CLASSIFIER_HOST}/api/version" >/dev/null; then
+      return 0
+    fi
+    echo ">> Classifier host ${CLASSIFIER_HOST} not answering — bringing up Ollama on ${CLASSIFIER_SSH_HOST} over SSH..."
+    if ! ssh -o ConnectTimeout=5 "$CLASSIFIER_SSH_HOST" true; then
+      echo "!! Could not reach '$CLASSIFIER_SSH_HOST' over SSH." >&2
+      return 1
+    fi
+    if ! ssh "$CLASSIFIER_SSH_HOST" 'command -v ollama' >/dev/null 2>&1; then
+      echo ">> Ollama not found on ${CLASSIFIER_SSH_HOST} — installing (official installer, needs sudo)..."
+      if ! ssh -t "$CLASSIFIER_SSH_HOST" 'curl -fsSL https://ollama.com/install.sh | sudo sh'; then
+        echo "!! Ollama install failed on ${CLASSIFIER_SSH_HOST}." >&2
+        return 1
+      fi
+    fi
+    echo ">> Starting ollama serve on ${CLASSIFIER_SSH_HOST} (binds 0.0.0.0:11434)..."
+    # The installer starts its own systemd-managed instance bound to
+    # 127.0.0.1 (not LAN-reachable) — stop that (sudo, hence _tty for the
+    # password prompt) and start our own bound to every interface instead,
+    # same pattern as the main Ollama --remote backend below.
+    remote_exec_tty "$CLASSIFIER_SSH_HOST" 'if systemctl is-active --quiet ollama 2>/dev/null; then sudo systemctl stop ollama; fi'
+    remote_script "$CLASSIFIER_SSH_HOST" <<'EOF'
+pkill -x ollama 2>/dev/null || true
+sleep 2
+OLLAMA_HOST=0.0.0.0:11434 OLLAMA_KEEP_ALIVE=-1 setsid nohup ollama serve >/tmp/ollama-classifier.log 2>&1 </dev/null &
+disown
+EOF
+    wait_for_http "http://${CLASSIFIER_HOST}/api/version" \
+      "Check /tmp/ollama-classifier.log on ${CLASSIFIER_SSH_HOST}, and that its firewall allows port 11434 from this LAN." soft
+  }
+
+  if ! ensure_classifier_server; then
+    echo "!! Continuing without a classifier override (auto-mode Bash/Edit/Write checks may be slow/unreliable)." >&2
+    CLASSIFIER_MODEL=""
+  fi
+
+  if [[ -n "$CLASSIFIER_MODEL" ]]; then
     echo ">> Pulling classifier model $CLASSIFIER_MODEL on ${CLASSIFIER_HOST} (no-op if already present)..."
     if OLLAMA_HOST="$CLASSIFIER_HOST" ollama pull "$CLASSIFIER_MODEL" \
-        && curl -sf "http://${CLASSIFIER_HOST}/api/generate" \
-             -d "{\"model\":\"${CLASSIFIER_MODEL}\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":\"30m\"}" >/dev/null; then
-      echo ">> Classifier ready: $CLASSIFIER_MODEL on ${CLASSIFIER_HOST}"
+        && curl -sf "http://${CLASSIFIER_HOST}/api/chat" \
+             -d "{\"model\":\"${CLASSIFIER_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"keep_alive\":-1,\"options\":{\"num_gpu\":${CLASSIFIER_NUM_GPU},\"num_ctx\":32768}}" >/dev/null; then
+      echo ">> Classifier ready: $CLASSIFIER_MODEL on ${CLASSIFIER_HOST} (GPU)"
     else
       echo "!! Could not pull/preload $CLASSIFIER_MODEL on ${CLASSIFIER_HOST} — continuing without a" >&2
       echo "!! classifier override (auto-mode Bash/Edit/Write checks may be slow/unreliable)." >&2
       CLASSIFIER_MODEL=""
     fi
-  else
-    echo "!! No Ollama server reachable at ${CLASSIFIER_HOST} (ml-server) — continuing without a" >&2
-    echo "!! classifier override (auto-mode Bash/Edit/Write checks may be slow/unreliable)." >&2
-    CLASSIFIER_MODEL=""
   fi
 
   # meshllm's 40960 context is much tighter than what a full Claude Code tool
@@ -280,6 +351,7 @@ if [[ "$BACKEND" == "meshllm" ]]; then
   echo ">> Starting translation proxy (:$PROXY_PORT -> $MESHLLM_HOST, protocol=openai${CLASSIFIER_MODEL:+, classifier=$CLASSIFIER_MODEL@$CLASSIFIER_HOST})..."
   nohup python3 "$TEMP_PROXY" "$PROXY_PORT" "$MESHLLM_HOST" "$TEMP_FLOOR" "$TEMP_CEIL" \
     "$TOP_P_CEIL" "$STRIP_TOOLS" "openai" "$CLASSIFIER_MODEL" "$CLASSIFIER_HOST" \
+    "claude-sonnet-5" "$CLASSIFIER_NUM_GPU" \
     >/tmp/hangarbaycc-proxy.log 2>&1 &
   disown
   wait_for_http "http://${PROXY_HOST}/v1/models" "Check /tmp/hangarbaycc-proxy.log"
@@ -342,24 +414,6 @@ if [[ -z "$REMOTE" && -t 0 ]]; then
 fi
 
 SERVER_LABEL="${REMOTE:-local}"
-
-# --- helpers for running a command on the target host (local or --remote) -----
-# Simple one-shot command, no pty (fine for anything that doesn't need a
-# terminal, e.g. a health check).
-remote_exec() {
-  if [[ -n "$REMOTE" ]]; then ssh "$REMOTE" "$1"; else bash -c "$1"; fi
-}
-# Same, but allocates a pty — needed for an interactive sudo password prompt.
-remote_exec_tty() {
-  if [[ -n "$REMOTE" ]]; then ssh -t "$REMOTE" "$1"; else bash -c "$1"; fi
-}
-# Multi-line script fed over stdin instead of as a quoted argument — avoids
-# quoting hell when a script mixes values already known here (interpolated
-# before sending) with variables meant to be evaluated on the target host
-# (escaped as \$foo so they survive to the far end literally).
-remote_script() {
-  if [[ -n "$REMOTE" ]]; then ssh "$REMOTE" bash -s; else bash -s; fi
-}
 
 if [[ -n "$REMOTE" ]]; then
   echo ">> Remote mode: Ollama server on '$REMOTE'; proxy + Claude Code stay here."
@@ -426,7 +480,7 @@ esac
 # Models live in either the system store or the user store on the TARGET host;
 # Ollama can only use one at a time, so point OLLAMA_MODELS at whichever store
 # has the chosen model there.
-MODEL_STORE="$(remote_script <<EOF
+MODEL_STORE="$(remote_script "$REMOTE" <<EOF
 for store in /var/lib/ollama/models "\$HOME/.ollama/models"; do
   manifest="\$store/manifests/registry.ollama.ai/library/${MODEL%%:*}/${MODEL##*:}"
   if [[ -f "\$manifest" ]]; then echo "\$store"; break; fi
@@ -509,7 +563,7 @@ echo ">> Context: $NUM_CTX | KV cache: $KV_CACHE_TYPE | temp band: [$TEMP_FLOOR,
 echo ">> Auto-compact window: $NUM_CTX (matches server context; /context headline still shows 200k — cosmetic)"
 
 # --- 0. GPU must be healthy before we do anything -----------------------------
-if ! remote_exec "nvidia-smi >/dev/null 2>&1"; then
+if ! remote_exec "$REMOTE" "nvidia-smi >/dev/null 2>&1"; then
   echo "!! GPU unavailable on ${SERVER_LABEL} (nvidia-smi failed)." >&2
   echo "!! Reboot / reset the driver there first." >&2
   exit 1
@@ -517,12 +571,12 @@ fi
 
 # --- 1. stop any running server (exact name; never pkill -f, it self-matches) -
 echo ">> Stopping any existing server on ${SERVER_LABEL}..."
-remote_exec_tty 'if systemctl is-active --quiet ollama 2>/dev/null; then sudo systemctl stop ollama; fi'
+remote_exec_tty "$REMOTE" 'if systemctl is-active --quiet ollama 2>/dev/null; then sudo systemctl stop ollama; fi'
 pkill -f "$TEMP_PROXY" 2>/dev/null || true   # stale temperature proxy from a prior run (always local)
 
 # --- 2. start the server with the settings above ------------------------------
 echo ">> Starting ollama serve on ${SERVER_LABEL}..."
-remote_script <<EOF
+remote_script "$REMOTE" <<EOF
 pkill -x ollama 2>/dev/null || true
 pkill -x llama-server 2>/dev/null || true
 pkill -x whisper-server 2>/dev/null || true
@@ -572,18 +626,18 @@ echo ">> Fully on GPU. Launching Claude Code..."
 # changes to account for it. Every failure here warns and skips dictation;
 # none of them should abort the coding session.
 if [[ -n "$DICTATE" ]]; then
-  if ! remote_exec "test -x ${WHISPER_DIR}/build/bin/whisper-server && test -f ${WHISPER_DIR}/models/${WHISPER_MODEL}"; then
+  if ! remote_exec "$REMOTE" "test -x ${WHISPER_DIR}/build/bin/whisper-server && test -f ${WHISPER_DIR}/models/${WHISPER_MODEL}"; then
     echo "!! whisper-server not set up on ${SERVER_LABEL} — run ./setup-whisper-server.sh ${REMOTE} first." >&2
     echo "!! Continuing without dictation." >&2
   else
-    FREE_MIB="$(remote_exec "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits" | head -1 | tr -d '[:space:]')"
+    FREE_MIB="$(remote_exec "$REMOTE" "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits" | head -1 | tr -d '[:space:]')"
     if [[ -z "$FREE_MIB" || "$FREE_MIB" -lt "$WHISPER_MIN_FREE_MIB" ]]; then
       echo "!! Only ${FREE_MIB:-0} MiB free on ${SERVER_LABEL} after loading ${MODEL}" >&2
       echo "!! (need ~${WHISPER_MIN_FREE_MIB} MiB for whisper-server) — skipping dictation." >&2
       echo "!! Pick a smaller context/more compressed KV cache to free headroom." >&2
     else
       echo ">> Starting whisper-server on ${SERVER_LABEL} (:${WHISPER_PORT}, ${FREE_MIB} MiB free)..."
-      remote_script <<EOF
+      remote_script "$REMOTE" <<EOF
 pkill -x whisper-server 2>/dev/null || true
 sleep 1
 cd ${WHISPER_DIR}
