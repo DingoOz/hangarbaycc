@@ -49,6 +49,9 @@ q4_0 buys nothing here since q8_0 already fits). At the launcher prompts, pick:
 - Context: **3** (128K / 131072)
 - KV cache: **2** (`q8_0`)
 
+`launch-aider.sh` also supports a remote **meshllm** backend in addition to
+these local Ollama models — see "Aider and the meshllm backend" below.
+
 ## The proxy (hangarbaycc-proxy.py)
 
 A transparent reverse proxy between Claude Code and Ollama that rewrites every
@@ -121,6 +124,27 @@ Baseline (2026-07-05, raw model sampling, single run each): `gpt-oss:20b`
 gpt-oss. See `.claude/skills/hangarbaycc-bench/` — in a cloud Claude Code
 session in this repo, `/hangarbaycc-bench` runs it and `/hangarbaycc-doctor`
 diagnoses a bad session from the logs.
+
+`run-bench.sh` also works against the meshllm backend (protocol is
+auto-detected from a `meshllm/` model prefix):
+`bench/run-bench.sh "meshllm/Qwen3-30B-A3B-Q4_K_M-layers" 192.168.1.16:9337`.
+
+## Aider and the meshllm backend
+
+`launch-aider.sh` can drive [Aider](https://aider.chat) against either a
+local Ollama model (same picker as `hangarbaycc.sh`) or **meshllm**, a
+remote, always-on, OpenAI-compatible LLM server on the LAN
+(`http://192.168.1.16:9337/v1`, model `meshllm/Qwen3-30B-A3B-Q4_K_M-layers`).
+Aider is a good fit for meshllm specifically because it drives edits via
+plain-text whole-file/diff formats instead of function/tool-calling, which
+meshllm's endpoint doesn't advertise support for. There's no HA here —
+availability depends on both the mesh-llm process (`ml-server`) and the
+Docker container hosting split layers (`rtx3070`) staying up.
+
+```
+./launch-aider.sh
+# Backend [1-2]: 2
+```
 
 ## Example prompts
 

@@ -6,10 +6,18 @@
 # Usage:
 #   bench/run-bench.sh MODEL [HOSTPORT]
 #
-#   MODEL     e.g. ornith:latest, gpt-oss:20b (must be loadable by the server)
-#   HOSTPORT  Anthropic-compat endpoint to hit. Default 127.0.0.1:11434 (the
-#             raw server = the model's own sampling). Point it at 127.0.0.1:11435
-#             instead to bench THROUGH the temp proxy and measure a temp band.
+#   MODEL     e.g. ornith:latest, gpt-oss:20b (must be loadable by the server),
+#             or meshllm/Qwen3-30B-A3B-Q4_K_M-layers for the LAN meshllm server.
+#   HOSTPORT  Endpoint to hit. Default 127.0.0.1:11434 (the raw Ollama server =
+#             the model's own sampling). Point it at 127.0.0.1:11435 instead to
+#             bench THROUGH the temp proxy and measure a temp band. For meshllm,
+#             pass its host:port, e.g. 192.168.1.16:9337.
+#
+#   Protocol is auto-detected from MODEL: a `meshllm/` prefix means an
+#   OpenAI-compatible /v1/chat/completions endpoint; anything else assumes
+#   Ollama's Anthropic-compat /v1/messages endpoint.
+#
+#   Example: bench/run-bench.sh "meshllm/Qwen3-30B-A3B-Q4_K_M-layers" 192.168.1.16:9337
 #
 # The server must already be running (hangarbaycc.sh starts one, or:
 #   OLLAMA_CONTEXT_LENGTH=32768 ollama serve).
@@ -28,9 +36,19 @@ STAMP="$(date +%Y%m%d-%H%M%S)"
 OUT="$RESULTS_DIR/${MODEL//[:\/]/_}-$STAMP.md"
 mkdir -p "$RESULTS_DIR"
 
-if ! curl -sf --max-time 3 "http://$HOSTPORT/api/version" >/dev/null; then
-  echo "!! No Ollama endpoint at $HOSTPORT — start the server (or proxy) first." >&2
-  exit 1
+PROTO="anthropic"
+[[ "$MODEL" == meshllm/* ]] && PROTO="openai"
+
+if [[ "$PROTO" == "openai" ]]; then
+  if ! curl -sf --max-time 3 "http://$HOSTPORT/v1/models" >/dev/null; then
+    echo "!! No OpenAI-compatible endpoint at $HOSTPORT — check the meshllm server." >&2
+    exit 1
+  fi
+else
+  if ! curl -sf --max-time 3 "http://$HOSTPORT/api/version" >/dev/null; then
+    echo "!! No Ollama endpoint at $HOSTPORT — start the server (or proxy) first." >&2
+    exit 1
+  fi
 fi
 
 echo "# hangarbaycc-bench: $MODEL" > "$OUT"
@@ -68,9 +86,15 @@ print(json.dumps({"model": sys.argv[1], "max_tokens": 8192,
                   "messages": [{"role": "user", "content": prompt}]}))
 PY
 )"
-  resp="$(curl -s --max-time 900 "http://$HOSTPORT/v1/messages" \
-    -H 'content-type: application/json' -H 'x-api-key: ollama' \
-    -H 'anthropic-version: 2023-06-01' -d "$payload")"
+  if [[ "$PROTO" == "openai" ]]; then
+    resp="$(curl -s --max-time 900 "http://$HOSTPORT/v1/chat/completions" \
+      -H 'content-type: application/json' -H 'Authorization: Bearer mesh' \
+      -d "$payload")"
+  else
+    resp="$(curl -s --max-time 900 "http://$HOSTPORT/v1/messages" \
+      -H 'content-type: application/json' -H 'x-api-key: ollama' \
+      -H 'anthropic-version: 2023-06-01' -d "$payload")"
+  fi
 
   note=""
   if ! printf '%s' "$resp" | python3 "$BENCH_DIR/extract-code.py" \

@@ -1,27 +1,69 @@
 #!/usr/bin/env bash
 #
-# launch-aider.sh — launch Aider wired to the local Ornith model.
+# launch-aider.sh — launch Aider wired to either a local Ollama model or the
+#                    LAN meshllm server.
 #
-# Sibling of hangarbaycc.sh (the HangarBayCC project). Same model picker,
-# context/KV-cache guard, and GPU-spill abort, but hands off to Aider instead
-# of Claude Code.
+# Sibling of hangarbaycc.sh (the HangarBayCC project), but hands off to Aider
+# instead of Claude Code. Two backends:
+#   - Ollama:   local model picker, context/KV-cache guard, GPU-spill abort
+#               (same shape as hangarbaycc.sh).
+#   - meshllm:  a remote, always-on, OpenAI-compatible server on the LAN —
+#               no local GPU/preload involvement, fixed model/context.
 #
-# Why Aider for a 9B-class model:
+# Why Aider (for either backend):
 #   - Forgiving edit formats (whole-file / unified-diff) instead of byte-exact
-#     Edit matching — removes the #1 failure mode for small models, so the
-#     hangarbaycc-editing-rules.md band-aid is unnecessary here.
-#   - Native temperature control (--temperature), so no temp-clamping proxy.
-#   - Smaller prompt/tool surface leaves more context window for real work.
+#     Edit matching — removes the #1 failure mode for small/local models, so
+#     the hangarbaycc-editing-rules.md band-aid is unnecessary here.
+#   - No function/tool-calling required — Aider parses edits out of plain
+#     chat text, so it works fine against a backend like meshllm that only
+#     advertises "text" capabilities (no tool-calling).
+#   - Native temperature control (--temperature-equivalent via extra_params),
+#     so no temp-clamping proxy needed.
 #
-# See hangarbaycc.sh for the measured VRAM fit table; it applies unchanged
-# (the model + KV cache live in the same ollama server process).
+# See hangarbaycc.sh for the measured VRAM fit table (Ollama backend only);
+# it applies unchanged (the model + KV cache live in the same ollama server
+# process).
 #
 set -euo pipefail
 
-HOST="127.0.0.1:11434"
-TARGET_TEMP="0.4"             # a 9B model wants lower than the default temp
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EDIT_RULES="$SCRIPT_DIR/hangarbaycc-editing-rules.md"
+
+# --- backend selection -----------------------------------------------------
+echo "Select backend:"
+echo "  1) Ollama    (local model — model/context/KV menus, GPU-spill guard)"
+echo "  2) meshllm   (LAN mesh-llm server, always-on, fixed config)"
+read -rp "Backend [1-2]: " BACKEND_CHOICE
+case "$BACKEND_CHOICE" in
+  1) BACKEND="ollama" ;;
+  2) BACKEND="meshllm" ;;
+  *) echo "!! Invalid backend choice: $BACKEND_CHOICE" >&2; exit 1 ;;
+esac
+
+if [[ "$BACKEND" == "meshllm" ]]; then
+  MESHLLM_HOST="192.168.1.16:9337"
+  MESHLLM_BASE="http://${MESHLLM_HOST}/v1"
+  MODEL="meshllm/Qwen3-30B-A3B-Q4_K_M-layers"
+  # Fixed server-side infra, not client-configurable here. Must match the
+  # server's actual advertised config — verify with:
+  #   curl -s http://192.168.1.16:9337/v1/models | python3 -m json.tool
+  NUM_CTX=40960
+  TARGET_TEMP="0.7"   # no prior guidance for this model; easy to tune here
+  API_KEY="mesh"      # no auth configured server-side; any value works
+
+  echo ">> Checking meshllm reachability at $MESHLLM_BASE ..."
+  if ! curl -sf -m 5 "$MESHLLM_BASE/models" >/dev/null; then
+    echo "!! meshllm server unreachable at $MESHLLM_BASE." >&2
+    echo "!! No HA/failover — this depends on BOTH ml-server (mesh-llm process)" >&2
+    echo "!! and rtx3070 (Docker container) staying up. Check both." >&2
+    exit 1
+  fi
+  echo ">> meshllm reachable. Model: $MODEL | Context: $NUM_CTX | temp: $TARGET_TEMP"
+fi
+
+if [[ "$BACKEND" == "ollama" ]]; then
+HOST="127.0.0.1:11434"
+TARGET_TEMP="0.4"             # a 9B model wants lower than the default temp
 
 # --- interactive selection -----------------------------------------------------
 echo "Select model:   (all fit any ctx/KV on 16 GB; see fit table in hangarbaycc.sh)"
@@ -119,22 +161,31 @@ if echo "$PROC" | grep -qi cpu; then
   exit 1
 fi
 echo ">> Fully on GPU. Launching Aider..."
+fi
 
 # --- 4. hand off to Aider -----------------------------------------------------
-# Aider talks to ollama through its OpenAI-compatible endpoint. The litellm
-# layer Aider uses needs:
-#   - OLLAMA_API_BASE pointing at the ollama server
-#   - the model named as ollama_chat/<model> (the _chat variant streams better
-#     and respects the chat template)
-#   - the context window set explicitly; otherwise litellm defaults to a small
-#     window and silently truncates. Mirror our chosen NUM_CTX.
-export OLLAMA_API_BASE="http://${HOST}"
+# Aider talks to the backend through litellm's OpenAI-compatible layer:
+#   - Ollama:  OLLAMA_API_BASE + model named ollama_chat/<model> (the _chat
+#     variant streams better and respects the chat template).
+#   - meshllm: OPENAI_API_BASE + OPENAI_API_KEY + model named openai/<model>
+#     (litellm's generic OpenAI-compatible provider — same shape, different
+#     prefix/env vars).
+# The context window is set explicitly in both cases; otherwise litellm
+# defaults to a small window and silently truncates. Mirrors NUM_CTX above.
+if [[ "$BACKEND" == "ollama" ]]; then
+  export OLLAMA_API_BASE="http://${HOST}"
+  AIDER_MODEL="ollama_chat/${MODEL}"
+else
+  export OPENAI_API_BASE="$MESHLLM_BASE"
+  export OPENAI_API_KEY="$API_KEY"
+  AIDER_MODEL="openai/${MODEL}"
+fi
 
 # Tell Aider the model's real context size so it doesn't truncate history.
-META_FILE="$(mktemp /tmp/aider-ornith-model-meta.XXXX.json)"
+META_FILE="$(mktemp /tmp/aider-model-meta.XXXX.json)"
 cat > "$META_FILE" <<JSON
 {
-  "ollama_chat/${MODEL}": {
+  "${AIDER_MODEL}": {
     "max_input_tokens": ${NUM_CTX},
     "max_output_tokens": 8192
   }
@@ -142,27 +193,41 @@ cat > "$META_FILE" <<JSON
 JSON
 
 # Aider has no --temperature flag; temperature is a per-model setting passed
-# through to the API via extra_params in a model-settings YAML.
-SETTINGS_FILE="$(mktemp /tmp/aider-ornith-model-settings.XXXX.yml)"
-cat > "$SETTINGS_FILE" <<YAML
-- name: ollama_chat/${MODEL}
+# through to the API via extra_params in a model-settings YAML. num_ctx is an
+# Ollama-specific request param (llama.cpp KV-cache size) — meaningless
+# against a generic OpenAI-compatible backend like meshllm, whose context is
+# fixed server-side, so it's only included for the Ollama backend.
+SETTINGS_FILE="$(mktemp /tmp/aider-model-settings.XXXX.yml)"
+if [[ "$BACKEND" == "ollama" ]]; then
+  cat > "$SETTINGS_FILE" <<YAML
+- name: ${AIDER_MODEL}
   edit_format: whole
   use_temperature: ${TARGET_TEMP}
   extra_params:
     temperature: ${TARGET_TEMP}
     num_ctx: ${NUM_CTX}
 YAML
+else
+  cat > "$SETTINGS_FILE" <<YAML
+- name: ${AIDER_MODEL}
+  edit_format: whole
+  use_temperature: ${TARGET_TEMP}
+  extra_params:
+    temperature: ${TARGET_TEMP}
+YAML
+fi
 
 AIDER_ARGS=(
-  --model "ollama_chat/${MODEL}"
+  --model "${AIDER_MODEL}"
   --model-metadata-file "$META_FILE"
   --model-settings-file "$SETTINGS_FILE"
   --no-show-model-warnings
 )
 
 # Edit format (whole-file) is set in the model-settings YAML above — the most
-# forgiving format for a 9B model. Switch edit_format to "diff" there once the
-# model proves it can produce clean unified diffs.
+# forgiving format, and kept for meshllm too as a safe first cut. meshllm's
+# Qwen3-30B is materially stronger than ornith, so "diff" is worth trying
+# there once whole-file edits prove reliable in practice.
 
 # Reuse the existing editing-rules note as read-only context if present.
 if [[ -f "$EDIT_RULES" ]]; then
