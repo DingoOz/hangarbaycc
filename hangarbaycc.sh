@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # hangarbaycc.sh — HangarBayCC: launch Claude Code wired to a local Ollama
-#                   model, with a chosen KV cache precision and context window.
+#                   model, or to meshllm (a remote OpenAI-compatible LAN
+#                   server), with a chosen KV cache precision and context
+#                   window (Ollama only — meshllm's config is fixed).
 #
 # Usage:
 #   ./hangarbaycc.sh                  run everything on this machine (default)
@@ -12,8 +14,15 @@
 #                                     (hostname, IP, or ssh-config alias).
 #   HANGARBAY_REMOTE=HOST ./hangarbaycc.sh   same, via env var instead of a flag.
 #
-# If neither the flag nor the env var is given, an interactive menu asks whether
-# to run locally or against a remote host (the remote default is 'ml-server').
+# On launch you first pick a backend — Ollama (local model, this machine or
+# --remote) or meshllm (an always-on OpenAI-compatible LLM server on the LAN,
+# reached through a translation proxy since Claude Code only speaks the
+# Anthropic Messages protocol). --remote/--dictate only apply to the Ollama
+# backend; meshllm is a fixed endpoint with no local GPU/server involvement.
+#
+# If neither the flag nor the env var is given, and Ollama is picked, an
+# interactive menu asks whether to run locally or against a remote host (the
+# remote default is 'ml-server').
 #
 # Remote mode requires: `ssh HOST` already works (key-based auth strongly
 # preferred — several separate ssh calls happen per launch); HOST has the GPU,
@@ -53,9 +62,16 @@
 # preload guard aborts on a CPU spill; if it triggers, re-run with a smaller
 # context and/or more compressed KV cache.
 #
-# OPTIONAL: voice dictation (--dictate / HANGARBAY_DICTATE=1, remote mode
-# only). Starts whisper-server (whisper.cpp, CUDA) on the GPU host's spare
-# VRAM AFTER the model above is confirmed 100% on GPU (~0.6 GB for the
+# meshllm backend: a fixed remote model (currently
+# meshllm/Qwen3-30B-A3B-Q4_K_M-layers at 192.168.1.16:9337, 40960 native
+# context) reached through hangarbaycc-proxy.py's protocol=openai translation
+# mode, which converts Claude Code's Anthropic Messages requests to OpenAI
+# Chat Completions and back (including streaming). No HA — depends on both
+# the mesh-llm process and its GPU host's Docker container staying up.
+#
+# OPTIONAL: voice dictation (--dictate / HANGARBAY_DICTATE=1, Ollama remote
+# mode only). Starts whisper-server (whisper.cpp, CUDA) on the GPU host's
+# spare VRAM AFTER the model above is confirmed 100% on GPU (~0.6 GB for the
 # default small.en q8_0 model — e.g. gpt-oss:20b @128K/q8_0 leaves ~3.5 GB of
 # headroom per the table above). One-time setup: ./setup-whisper-server.sh
 # [HOST]. Then bind hangarbay-dictate.sh to a hotkey to talk into the Claude
@@ -69,8 +85,9 @@ Usage: hangarbaycc.sh [-r|--remote HOST] [-d|--dictate]
 
   -r, --remote HOST   Run the Ollama server on HOST over SSH instead of this
                        machine. The proxy and Claude Code still run here.
+                       Ollama backend only.
   -d, --dictate        Start voice dictation (whisper-server on the GPU host).
-                       Remote mode only; see README.md "Voice dictation".
+                       Ollama remote mode only; see README.md "Voice dictation".
   -h, --help           Show this help.
 
 HOST may also come from the HANGARBAY_REMOTE environment variable; the flag
@@ -97,6 +114,214 @@ done
 REMOTE="${REMOTE:-${HANGARBAY_REMOTE:-}}"
 DICTATE="${DICTATE:-${HANGARBAY_DICTATE:-}}"
 
+# --- backend selection ----------------------------------------------------
+echo "Select backend:"
+echo "  1) Ollama    (local model — this machine or --remote; model/context/KV menus)"
+echo "  2) meshllm   (LAN mesh-llm server, always-on, fixed config)"
+read -rp "Backend [1-2]: " BACKEND_CHOICE
+case "$BACKEND_CHOICE" in
+  1) BACKEND="ollama" ;;
+  2) BACKEND="meshllm" ;;
+  *) echo "!! Invalid backend choice: $BACKEND_CHOICE" >&2; exit 1 ;;
+esac
+
+# --- shared infra (both backends) ------------------------------------------
+PROXY_HOST="127.0.0.1:11435"   # translation/temperature-clamping proxy; always local
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EDIT_RULES="$SCRIPT_DIR/hangarbaycc-editing-rules.md"
+TEMP_PROXY="$SCRIPT_DIR/hangarbaycc-proxy.py"
+
+# Small models emit malformed/hallucinated tool calls when too many tools are
+# in context. The proxy STRIPS these from the `tools` schema on every
+# /v1/messages request, so the model never sees them at all — no hallucinated
+# calls, and several thousand tokens of schema freed for actual code context.
+# --disallowedTools is kept as a backstop (it auto-denies at execution time in
+# case a call slips through, e.g. when the proxy isn't running).
+# 'Task' is kept here only for older builds; the live subagent tool is 'Agent'.
+DISALLOWED_TOOLS=(Task Agent Workflow WebFetch WebSearch NotebookEdit)
+
+# Poll a URL until it answers or we give up, instead of looping forever (a
+# blocked port or a server that never starts would otherwise hang the
+# launcher indefinitely). mode="soft" returns 1 on timeout instead of exiting
+# — used for optional features (dictation) that should degrade, not abort.
+wait_for_http() {
+  local url="$1" hint="${2:-}" mode="${3:-hard}" tries=60
+  until curl -sf "$url" >/dev/null 2>&1; do
+    tries=$((tries - 1))
+    if [[ $tries -le 0 ]]; then
+      echo "!! Timed out waiting for ${url} to answer." >&2
+      [[ -n "$hint" ]] && echo "!! $hint" >&2
+      [[ "$mode" == "soft" ]] && return 1
+      exit 1
+    fi
+    sleep 0.5
+  done
+}
+
+# `ollama launch claude` sets CLAUDE_CODE_SUBAGENT_MODEL to EMPTY. Claude's logic
+# is: if the var is set and != "inherit", use it; otherwise fall back to a default
+# 'sonnet' alias — which a local/meshllm backend cannot serve, so every spawned
+# agent panel errors with "There's an issue with the selected model". Forcing
+# "inherit" makes any subagent reuse the running model instead, so a stray
+# Agent call is harmless rather than an error.
+#
+# Claude Code doesn't know this model, so it assumes its 200K default context
+# window: /context shows 200k regardless of what we actually configured, and —
+# more importantly — auto-compaction would never trigger before the real
+# server-side limit, at which point the backend silently context-shifts (drops
+# the oldest messages, including our appended editing rules) instead of Claude
+# Code compacting on purpose. CLAUDE_CODE_AUTO_COMPACT_WINDOW pins the
+# effective/auto-compact window to NUM_CTX, so compaction fires at the real
+# limit; /context then shows "Auto-compact window: <NUM_CTX> tokens (from
+# CLAUDE_CODE_AUTO_COMPACT_WINDOW)". The headline total still reads 200k —
+# that's cosmetic only, hardcoded per model ID with no override that doesn't
+# also disable auto-compaction entirely (rejected: worse than a wrong number).
+#
+# Both settings passed via --settings (scoped to THIS launch only; your normal
+# cloud Claude is untouched). settings.env beats process env. Called after
+# NUM_CTX is finalized in each backend branch below, so it reflects the actual
+# server context rather than the raw menu choice.
+build_launch_settings() {
+  printf '{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"inherit","CLAUDE_CODE_AUTO_COMPACT_WINDOW":"%s"}}' "$NUM_CTX"
+}
+
+# --- meshllm backend --------------------------------------------------------
+if [[ "$BACKEND" == "meshllm" ]]; then
+  [[ -n "$REMOTE" || -n "$DICTATE" ]] && \
+    echo "!! --remote/--dictate don't apply to the meshllm backend (fixed LAN endpoint); ignoring." >&2
+
+  MESHLLM_HOST="192.168.1.16:9337"
+  MESHLLM_BASE="http://${MESHLLM_HOST}/v1"
+  MODEL="meshllm/Qwen3-30B-A3B-Q4_K_M-layers"
+  NUM_CTX=40960
+  TEMP_FLOOR=0.7; TEMP_CEIL=0.85; TOP_P_CEIL=1.0   # no established guidance yet; easy to tune
+  PROXY_PORT="${PROXY_HOST##*:}"
+
+  echo ">> Checking meshllm reachability at $MESHLLM_BASE ..."
+  if ! curl -sf -m 5 "$MESHLLM_BASE/models" >/dev/null; then
+    echo "!! meshllm server unreachable at $MESHLLM_BASE." >&2
+    echo "!! No HA/failover — depends on BOTH ml-server (mesh-llm process) and" >&2
+    echo "!! rtx3070 (Docker container) staying up. Check both." >&2
+    exit 1
+  fi
+
+  LAUNCH_SETTINGS="$(build_launch_settings)"
+
+  # Claude Code's "auto mode" runs a separate safety-classifier call before
+  # executing tools like Bash, to judge whether the command is safe to
+  # auto-approve. That call always requests "claude-sonnet-5" (Claude Code's
+  # hardcoded default) — setting CLAUDE_CODE_AUTO_MODE_MODEL as a plain env
+  # var does NOT change this (confirmed by live-capturing the request body).
+  # Against a real Anthropic backend that's fine; against meshllm it's a
+  # request for a model that doesn't exist there, AND meshllm's own 10-20s+
+  # per-call latency (it burns hidden reasoning tokens even on trivial
+  # replies) blows past whatever short timeout the classifier expects anyway
+  # — so Claude Code can't safety-check (and therefore can't run) Bash at
+  # all. The proxy (see hangarbaycc-proxy.py's CLASSIFIER_* args) detects any
+  # request naming "claude-sonnet-5", rewrites it to CLASSIFIER_MODEL, and
+  # routes it to a small local Ollama model instead — warm latency ~2-3s for
+  # a short reply, vastly more reliable than meshllm for this purpose.
+  # Best-effort: if the local Ollama server isn't reachable or the pull
+  # fails, warn and continue without a classifier override rather than
+  # aborting the whole session (the original behavior — classifier calls
+  # erroring against meshllm — still applies, so Bash/Edit/Write may be
+  # unreliable, but read-only work still functions).
+  # Runs on ml-server (LAN, already hosts the coding-model Ollama store) rather
+  # than this laptop: same ~2-3s warm latency as a tiny local model, but with
+  # a real 14B instruct model's judgment (live-tested: correctly says "No" to
+  # `rm -rf /`, where a 0.5B model wrongly said it was safe — see project
+  # memory/discussion). ml-server's GPU is already ~full with mesh-llm's own
+  # layers (331 MiB free of 16 GB), so this runs CPU-only there too — its 12
+  # cores are just enough faster than this laptop's to match the tiny model's
+  # latency. No pull needed, it's already in ml-server's store. keep_alive is
+  # bounded (30m), NOT indefinite — ml-server is a shared host also running
+  # mesh-llm itself, and this model is ~9 GB; squatting on that RAM forever
+  # after the session ends would be inconsiderate of a resource other things
+  # depend on.
+  CLASSIFIER_MODEL="qwen2.5:14b-instruct-q4_K_M"
+  CLASSIFIER_HOST="192.168.1.16:11434"  # ml-server, same LAN host as meshllm's mesh-llm process
+  if curl -sf -m 5 "http://${CLASSIFIER_HOST}/api/version" >/dev/null; then
+    echo ">> Pulling classifier model $CLASSIFIER_MODEL on ${CLASSIFIER_HOST} (no-op if already present)..."
+    if OLLAMA_HOST="$CLASSIFIER_HOST" ollama pull "$CLASSIFIER_MODEL" \
+        && curl -sf "http://${CLASSIFIER_HOST}/api/generate" \
+             -d "{\"model\":\"${CLASSIFIER_MODEL}\",\"prompt\":\"hi\",\"stream\":false,\"keep_alive\":\"30m\"}" >/dev/null; then
+      echo ">> Classifier ready: $CLASSIFIER_MODEL on ${CLASSIFIER_HOST}"
+    else
+      echo "!! Could not pull/preload $CLASSIFIER_MODEL on ${CLASSIFIER_HOST} — continuing without a" >&2
+      echo "!! classifier override (auto-mode Bash/Edit/Write checks may be slow/unreliable)." >&2
+      CLASSIFIER_MODEL=""
+    fi
+  else
+    echo "!! No Ollama server reachable at ${CLASSIFIER_HOST} (ml-server) — continuing without a" >&2
+    echo "!! classifier override (auto-mode Bash/Edit/Write checks may be slow/unreliable)." >&2
+    CLASSIFIER_MODEL=""
+  fi
+
+  # meshllm's 40960 context is much tighter than what a full Claude Code tool
+  # surface needs — a live test measured ~57KB (~14K tokens) of tool schemas
+  # alone beyond the base DISALLOWED_TOOLS strip list, pushing a single empty
+  # turn's request to ~52K tokens and getting rejected outright ("no
+  # context-compatible target ... can fit approximately 52194 tokens"). These
+  # extra tools (background task/cron/worktree/monitoring/messaging — not
+  # needed for basic file-editing coding work) are stripped ADDITIONALLY here,
+  # on top of the base list, without changing DISALLOWED_TOOLS itself (that
+  # array is shared with the Ollama backend's --disallowedTools flag below,
+  # which shouldn't change). Stripping a tool name that isn't actually present
+  # in a given session's tools array is a harmless no-op.
+  MESHLLM_STRIP_TOOLS=(
+    "${DISALLOWED_TOOLS[@]}"
+    CronCreate CronDelete CronList DesignSync EnterWorktree ExitWorktree
+    Monitor PushNotification ReportFindings ScheduleWakeup SendMessage Skill
+    TaskCreate TaskGet TaskList TaskOutput TaskStop TaskUpdate
+  )
+
+  pkill -f "$TEMP_PROXY" 2>/dev/null || true   # stale proxy from a prior run
+  STRIP_TOOLS="$(IFS=,; echo "${MESHLLM_STRIP_TOOLS[*]}")"
+  echo ">> Starting translation proxy (:$PROXY_PORT -> $MESHLLM_HOST, protocol=openai${CLASSIFIER_MODEL:+, classifier=$CLASSIFIER_MODEL@$CLASSIFIER_HOST})..."
+  nohup python3 "$TEMP_PROXY" "$PROXY_PORT" "$MESHLLM_HOST" "$TEMP_FLOOR" "$TEMP_CEIL" \
+    "$TOP_P_CEIL" "$STRIP_TOOLS" "openai" "$CLASSIFIER_MODEL" "$CLASSIFIER_HOST" \
+    >/tmp/hangarbaycc-proxy.log 2>&1 &
+  disown
+  wait_for_http "http://${PROXY_HOST}/v1/models" "Check /tmp/hangarbaycc-proxy.log"
+
+  # Kill the proxy when Claude Code exits.
+  cleanup() { pkill -f "$TEMP_PROXY" 2>/dev/null || true; }
+  trap cleanup EXIT
+
+  export ANTHROPIC_BASE_URL="http://${PROXY_HOST}"
+  export ANTHROPIC_MODEL="$MODEL"
+  export ANTHROPIC_AUTH_TOKEN="mesh"   # proxy doesn't validate this; claude just needs *a* value
+  # NOT setting CLAUDE_CODE_AUTO_MODE_MODEL here — confirmed to have no effect
+  # as a plain env var (see the classifier comment above). The proxy handles
+  # classifier routing by request content instead.
+
+  echo ">> Backend: meshllm | Model: $MODEL | Context: $NUM_CTX | temp band: [$TEMP_FLOOR, $TEMP_CEIL]"
+  echo ">> Auto-compact window: $NUM_CTX (matches server context; /context headline still shows 200k — cosmetic)"
+
+  # No `ollama launch claude` here — that subcommand tries to pull MODEL from
+  # the Ollama registry and fails outright for a non-Ollama model name. claude
+  # itself honours ANTHROPIC_BASE_URL/ANTHROPIC_MODEL/ANTHROPIC_AUTH_TOKEN
+  # directly, so we call it straight (NOT via `exec` — the script must stay
+  # alive after Claude Code exits so the `trap cleanup EXIT` above actually
+  # runs and stops the proxy; `exec` would replace this shell entirely and
+  # skip trap handling).
+  if [[ -f "$EDIT_RULES" ]]; then
+    echo ">> Appending editing rules from $EDIT_RULES"
+    echo ">> Stripping tools at the proxy (and auto-denying as backstop): ${MESHLLM_STRIP_TOOLS[*]}"
+    claude --settings "$LAUNCH_SETTINGS" \
+      --append-system-prompt "$(cat "$EDIT_RULES")" \
+      --disallowedTools "${MESHLLM_STRIP_TOOLS[@]}"
+  else
+    echo "!! $EDIT_RULES not found — launching without the editing-rules prompt." >&2
+    echo ">> Stripping tools at the proxy (and auto-denying as backstop): ${MESHLLM_STRIP_TOOLS[*]}"
+    claude --settings "$LAUNCH_SETTINGS" --disallowedTools "${MESHLLM_STRIP_TOOLS[@]}"
+  fi
+
+  echo ">> Session over. Translation proxy stopped. meshllm is always-on — nothing to leave warm here."
+  exit 0
+fi
+
+# --- Ollama backend ----------------------------------------------------------
 # If no host was given via flag or env var, offer an interactive choice between
 # running everything locally or targeting a remote Ollama server. A flag/env var
 # takes precedence, so this is skipped when either was supplied; it's also
@@ -136,24 +361,6 @@ remote_script() {
   if [[ -n "$REMOTE" ]]; then ssh "$REMOTE" bash -s; else bash -s; fi
 }
 
-# Poll a URL until it answers or we give up, instead of looping forever (a
-# blocked port or a server that never starts would otherwise hang the
-# launcher indefinitely). mode="soft" returns 1 on timeout instead of exiting
-# — used for optional features (dictation) that should degrade, not abort.
-wait_for_http() {
-  local url="$1" hint="${2:-}" mode="${3:-hard}" tries=60
-  until curl -sf "$url" >/dev/null 2>&1; do
-    tries=$((tries - 1))
-    if [[ $tries -le 0 ]]; then
-      echo "!! Timed out waiting for ${url} to answer." >&2
-      [[ -n "$hint" ]] && echo "!! $hint" >&2
-      [[ "$mode" == "soft" ]] && return 1
-      exit 1
-    fi
-    sleep 0.5
-  done
-}
-
 if [[ -n "$REMOTE" ]]; then
   echo ">> Remote mode: Ollama server on '$REMOTE'; proxy + Claude Code stay here."
   if ! ssh -o ConnectTimeout=5 "$REMOTE" true; then
@@ -176,10 +383,6 @@ else
   SERVER_BIND="127.0.0.1:11434"
   API_HOST="127.0.0.1:11434"
 fi
-PROXY_HOST="127.0.0.1:11435"   # temperature-clamping proxy; always local
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-EDIT_RULES="$SCRIPT_DIR/hangarbaycc-editing-rules.md"
-TEMP_PROXY="$SCRIPT_DIR/hangarbaycc-proxy.py"
 
 # Voice dictation (optional, remote mode only): whisper-server binds every
 # interface on the GPU host (same posture as Ollama's SERVER_BIND above), the
@@ -197,42 +400,6 @@ WHISPER_DIR='$HOME/whisper.cpp'   # single-quoted: expanded on the TARGET host
 WHISPER_MODEL="${WHISPER_MODEL:-ggml-small.en-q8_0.bin}"
 WHISPER_MIN_FREE_MIB=1000
 WHISPER_ENDPOINT_FILE="${XDG_RUNTIME_DIR:-/tmp}/hangarbay-whisper-endpoint"
-
-# Small models emit malformed/hallucinated tool calls when too many tools are
-# in context. The temp proxy STRIPS these from the `tools` schema on every
-# /v1/messages request, so the model never sees them at all — no hallucinated
-# calls, and several thousand tokens of schema freed for actual code context.
-# --disallowedTools is kept as a backstop (it auto-denies at execution time in
-# case a call slips through, e.g. when the proxy isn't running).
-# 'Task' is kept here only for older builds; the live subagent tool is 'Agent'.
-DISALLOWED_TOOLS=(Task Agent Workflow WebFetch WebSearch NotebookEdit)
-
-# `ollama launch claude` sets CLAUDE_CODE_SUBAGENT_MODEL to EMPTY. Claude's logic
-# is: if the var is set and != "inherit", use it; otherwise fall back to a default
-# 'sonnet' alias — which this local Ollama cannot serve, so every spawned agent
-# panel errors with "There's an issue with the selected model". Forcing "inherit"
-# makes any subagent reuse the running local model instead, so a stray Agent call
-# is harmless rather than an error.
-#
-# Claude Code doesn't know this model, so it assumes its 200K default context
-# window: /context shows 200k regardless of what we actually configured, and —
-# more importantly — auto-compaction would never trigger before the Ollama
-# server's real limit, at which point llama-server silently context-shifts
-# (drops the oldest messages, including our appended editing rules) instead of
-# Claude Code compacting on purpose. CLAUDE_CODE_AUTO_COMPACT_WINDOW pins the
-# effective/auto-compact window to NUM_CTX, so compaction fires at the real
-# limit; /context then shows "Auto-compact window: <NUM_CTX> tokens (from
-# CLAUDE_CODE_AUTO_COMPACT_WINDOW)". The headline total still reads 200k —
-# that's cosmetic only, hardcoded per model ID with no override that doesn't
-# also disable auto-compaction entirely (rejected: worse than a wrong number).
-#
-# Both settings passed via --settings (scoped to THIS launch only; your normal
-# cloud Claude is untouched). settings.env beats process env. Built here,
-# after NUM_CTX is finalized (post MAX_CTX clamp), so it reflects the actual
-# server context rather than the raw menu choice.
-build_launch_settings() {
-  printf '{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"inherit","CLAUDE_CODE_AUTO_COMPACT_WINDOW":"%s"}}' "$NUM_CTX"
-}
 
 # --- interactive selection -----------------------------------------------------
 # Each model carries its own max context and sampling band. Claude Code sends
