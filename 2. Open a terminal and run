@@ -1,0 +1,2 @@
+gcc prime_numbers.c -o prime_numbers -lm
+./prime_numbers
