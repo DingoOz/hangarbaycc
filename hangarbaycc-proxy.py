@@ -150,12 +150,41 @@ CLASSIFIER_NUM_CTX = 32768
 
 # The classifier request's own context (system + full message history Claude
 # Code sends it) grows with the conversation just like the main turn's does —
-# live-observed reaching ~121KB (~30K tokens). Trimmed aggressively: drop the
-# OLDEST messages first, always keeping the last one (the actual action
-# being judged) and the system prompt (the auto-mode rules — needed to judge
-# anything at all). ~8KB keeps CPU prefill to single-digit seconds
-# (live-measured: ~2.5KB->3.9s, ~6KB->7.1s, ~12KB->15.4s — roughly linear).
-CLASSIFIER_CONTEXT_BUDGET_BYTES = 8_000
+# live-observed reaching ~121KB (~30K tokens), of which ~110KB is Claude
+# Code's own auto-mode system prompt (fairly constant across calls in one
+# session, not the growing part). Trimmed: drop the OLDEST messages first,
+# always keeping the last one (the actual action being judged) and the
+# system prompt (the auto-mode rules — needed to judge anything at all).
+#
+# 8KB (the original CPU-era budget, tuned for ml-server's ~180-215 tok/s CPU
+# prefill) turned out to be the wrong lever entirely once this moved to a
+# dedicated GPU host (gtx1070): it trimmed the ~110KB system prompt down to
+# ~4KB, discarding ~96% of Claude Code's actual judging criteria — live
+# testing traced this to malformed/unparseable classifier verdicts ("Auto
+# mode could not evaluate this action") on entirely benign commands, not
+# genuine denials. 48KB keeps far more of the real instructions while
+# staying inside a latency band a GTX 1070 (Pascal, no tensor cores) can
+# still clear in single-digit-to-teens seconds once warm.
+#
+# Live-measured on gtx1070 (llama3.2:3b, num_ctx=32768, OLLAMA_NUM_PARALLEL=1
+# so sequential calls always land in the same slot): prefill scales
+# super-linearly with context, not linearly like the old CPU numbers — ~6.6K
+# tokens (~46KB) -> 7.9s cold prefill, ~17K tokens (~82KB) -> 35.7s cold
+# prefill (a >4x token increase costing >4x time, not ~2.5x). Enabling
+# OLLAMA_FLASH_ATTENTION made no measurable difference at either size, so the
+# GPU's raw compute — not the attention implementation — is the limit here.
+# Ollama's prompt-prefix cache makes this a ONE-TIME cost per session, though:
+# once a system prompt of a given byte-identical prefix has been prefilled
+# once, every later call reusing that exact prefix pays ~0.1s prefill
+# regardless of size (live-confirmed at both 46KB and 82KB) — only token
+# generation (a few seconds to ~15s for a short verdict) remains per call.
+# 48KB was chosen to keep that one-time first-call cost comfortably under
+# the proxy's classifier timeout (see CLASSIFIER_UPSTREAM's HTTPConnection
+# call) rather than pushing all the way to the full ~110KB prompt, which
+# measured ~45-60s cold — too close to (and in one live case, evidently
+# over) whatever Claude Code's own client-side patience for a classifier
+# reply actually is.
+CLASSIFIER_CONTEXT_BUDGET_BYTES = 48_000
 
 # meshllm processes one request at a time and instantly rejects (429/404,
 # 0.0s — it doesn't queue) anything that arrives while it's busy. Claude Code
@@ -847,29 +876,34 @@ class Proxy(BaseHTTPRequestHandler):
 
     def _relay_classifier(self, data: dict, length: int):
         """Auto-mode classifier path: translate the (already model-rewritten,
-        context-trimmed) Anthropic request to Ollama-native /api/chat, force
-        CPU (num_gpu=0 — see CLASSIFIER_NUM_CTX's comment for why), and
-        translate the response back. Always calls Ollama non-streaming
-        (classifier replies are a handful of tokens — not worth handling
-        Ollama's own streaming line-framing for this); if the ORIGINAL
-        request asked for stream:true, synthesizes a minimal single-shot
-        Anthropic SSE sequence from the one blocking response instead of
-        real incremental streaming."""
+        context-trimmed) Anthropic request to Ollama-native /api/chat with
+        CLASSIFIER_NUM_GPU (0 to force CPU when the classifier host's GPU has
+        no headroom, -1 to let Ollama use the GPU on a dedicated host — see
+        CLASSIFIER_NUM_CTX's comment), and translate the response back.
+        Always calls Ollama non-streaming (classifier replies are a handful
+        of tokens — not worth handling Ollama's own streaming line-framing
+        for this); if the ORIGINAL request asked for stream:true, synthesizes
+        a minimal single-shot Anthropic SSE sequence from the one blocking
+        response instead of real incremental streaming."""
         requested_model = data.get("model") or "unknown"
         want_streaming = bool(data.get("stream"))
         ollama_body = json.dumps(to_ollama_native_request(data)).encode("utf-8")
 
-        # Short timeout on purpose: this is a safety classifier, not the main
-        # conversation — if trimming somehow still leaves it too large to
-        # answer quickly, failing fast (and falling back to Claude Code's own
-        # "continue with other tasks" degradation) beats blocking the whole
-        # session for minutes. Live-measured normal (warm) case is well under
-        # 1s; 45s leaves headroom for an occasional cold reload (keep_alive=-1
-        # in to_ollama_native_request should make that rare, but ml-server
-        # restarting or the model getting evicted some other way isn't ruled
-        # out) without going back to the original 120s that caused the
-        # multi-minute stalls this whole area of the code exists to avoid.
-        conn = http.client.HTTPConnection(CLASSIFIER_UPSTREAM, timeout=45)
+        # This is a safety classifier, not the main conversation — if the
+        # model can't answer at all, failing fast (and falling back to Claude
+        # Code's own degradation) beats blocking the whole session for
+        # minutes. 90s (up from an original CPU-era 45s) leaves headroom for
+        # the ONE-TIME cold prefill of a fresh system-prompt prefix on a
+        # dedicated GPU host — live-measured on gtx1070 at up to ~36s cold
+        # for CLASSIFIER_CONTEXT_BUDGET_BYTES's ~46KB budget, plus generation
+        # time (see CLASSIFIER_CONTEXT_BUDGET_BYTES's comment for the full
+        # latency breakdown). Every later call in the session that reuses the
+        # same system-prompt prefix hits Ollama's prompt cache and finishes
+        # in a few seconds regardless of this ceiling. Not raised further
+        # than that to still fail fast on a genuinely wedged/evicted model
+        # rather than repeating the original 120s multi-minute-stall bug this
+        # whole area of the code exists to avoid.
+        conn = http.client.HTTPConnection(CLASSIFIER_UPSTREAM, timeout=90)
         t0 = time.time()
         status = None
         stop_reason = None

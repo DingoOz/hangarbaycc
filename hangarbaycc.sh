@@ -299,11 +299,21 @@ if [[ "$BACKEND" == "meshllm" ]]; then
     # 127.0.0.1 (not LAN-reachable) — stop that (sudo, hence _tty for the
     # password prompt) and start our own bound to every interface instead,
     # same pattern as the main Ollama --remote backend below.
+    #
+    # OLLAMA_NUM_PARALLEL=1 is load-bearing, not just tidy: Ollama's
+    # prompt-prefix cache (which makes every classifier call after the first
+    # in a session nearly free — see hangarbaycc-proxy.py's
+    # CLASSIFIER_CONTEXT_BUDGET_BYTES comment) only reliably reuses the same
+    # KV cache when sequential requests land in the same slot. With more than
+    # one parallel slot, concurrent classifier calls (Claude Code does fire
+    # more than one at once sometimes) could land in different slots and
+    # silently lose the cache hit, reintroducing the full cold-prefill cost
+    # on calls that should have been fast.
     remote_exec_tty "$CLASSIFIER_SSH_HOST" 'if systemctl is-active --quiet ollama 2>/dev/null; then sudo systemctl stop ollama; fi'
     remote_script "$CLASSIFIER_SSH_HOST" <<'EOF'
 pkill -x ollama 2>/dev/null || true
 sleep 2
-OLLAMA_HOST=0.0.0.0:11434 OLLAMA_KEEP_ALIVE=-1 setsid nohup ollama serve >/tmp/ollama-classifier.log 2>&1 </dev/null &
+OLLAMA_HOST=0.0.0.0:11434 OLLAMA_KEEP_ALIVE=-1 OLLAMA_NUM_PARALLEL=1 setsid nohup ollama serve >/tmp/ollama-classifier.log 2>&1 </dev/null &
 disown
 EOF
     wait_for_http "http://${CLASSIFIER_HOST}/api/version" \
