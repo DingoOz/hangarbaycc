@@ -309,34 +309,64 @@ instance before starting a fresh one. Stop it by hand with:
 
 ## Grok Build backend
 
-Backend option 4 launches [Grok Build](https://x.ai) (the `grok` CLI) instead
-of Claude Code, wired to the model `grok-local` — really just a set of
-scripts in `~/Programming/grok-local` on `ml-server` — runs: `llama-server`
-serving Qwen3.6-35B-A3B, fixed at `:8081`, 128K context, `q8_0` KV,
-`n-cpu-moe 20`.
+Backend options 4 and 5 launch [Grok Build](https://x.ai) (the `grok` CLI)
+instead of Claude Code, wired to a Qwen3.6-35B-A3B `llama-server`. No proxy
+is involved either way — `llama-server` already speaks OpenAI-compatible
+`/v1/chat/completions` natively, and `grok` is a native OpenAI-compatible
+client (unlike Claude Code, which needs `hangarbaycc-proxy.py`'s
+Anthropic-to-OpenAI translation). `grok` itself always runs on the machine
+you launch `hangarbaycc.sh` from; the two options differ in where the model
+server runs:
 
-Unlike `grok-local.sh` (which runs both the model *and* the `grok` TUI on
-ml-server), this backend only starts/reuses the model server on ml-server
-over SSH; `grok` itself runs on the machine you launch `hangarbaycc.sh` from,
-talking to ml-server over the LAN. No proxy is involved — `llama-server`
-already speaks OpenAI-compatible `/v1/chat/completions` natively, and `grok`
-is a native OpenAI-compatible client (unlike Claude Code, which needs
-`hangarbaycc-proxy.py`'s Anthropic-to-OpenAI translation).
+### Option 4 — ml-server (remote)
 
-Fixed host, fixed model config — same posture as meshllm above, no
-model/context/KV menus. The first run adds a `[model.qwen36-mlserver]` entry
-to your `~/.grok/config.toml` pointing at `http://192.168.1.16:8081/v1`
-(only `~/.grok/config.toml` is read for model definitions — project-scoped
-`.grok/config.toml` only supports `[mcp_servers]`); later runs reuse it.
+The model is `grok-local` — really just a set of scripts in
+`~/Programming/grok-local` on `ml-server` — running `llama-server` fixed at
+`:8081`, 128K context, `q8_0` KV, `n-cpu-moe 20`. Unlike `grok-local.sh`
+(which runs both the model *and* the `grok` TUI on ml-server), this backend
+only starts/reuses the model server on ml-server over SSH; `grok` talks to it
+over the LAN. The first run adds a `[model.qwen36-mlserver]` entry to
+`~/.grok/config.toml` pointing at `http://192.168.1.16:8081/v1`.
+
+**Requires:** the model already downloaded on ml-server
+(`~/Programming/grok-local/bin/download-qwen36.sh` if not).
+
+### Option 5 — local (this machine only)
+
+The model server is `grok-local-server.sh`, vendored into this repo (so
+`hangarbaycc.sh` has no external script reference) from
+`~/ai-models/qwen3.6-35b-a3b/run.sh` — `llama-server` fixed at `:8080`, 200K
+context, `q8_0` KV, tuned for a 16 GB GPU. No SSH, no LAN dependency —
+everything stays on this box. The model weights and the `llama-server`
+binary itself still live outside the repo (too large to vendor); both paths
+are overridable via `GROK_LOCAL_MODEL_DIR` and `GROK_LOCAL_LLAMA_SERVER` if
+yours differ from the defaults (`~/ai-models/qwen3.6-35b-a3b` and
+`~/llama.cpp/build/bin/llama-server`). The first run adds a
+`[model.qwen36-local]` entry to `~/.grok/config.toml` pointing at
+`http://127.0.0.1:8080/v1`.
+
+**Requires:** the weights present at `GROK_LOCAL_MODEL_DIR` (or the default
+above) and a built `llama-server` at `GROK_LOCAL_LLAMA_SERVER`.
+
+### Both options
+
+Fixed model config — no model/context/KV menus, same posture as meshllm
+above. `~/.grok/config.toml` is the only place model definitions are read
+from (project-scoped `.grok/config.toml` only supports `[mcp_servers]`), so
+both options' entries live there side by side; later runs reuse whichever
+entry already exists.
 
 If the model server isn't already up, it takes a while to load (a 35B MoE on
 one consumer GPU) — the launcher polls `/health` until it answers, same as
 the Ollama backend's wait step. Left running afterward so it stays warm for
 the next launch, same as Ollama.
 
-**Requires:** the `grok` CLI installed and logged in on the client machine,
-and the model already downloaded on ml-server
-(`~/Programming/grok-local/bin/download-qwen36.sh` if not).
+If the `grok` CLI itself isn't on `PATH`, either option offers to install it
+on the spot (`curl -fsSL https://x.ai/cli/install.sh | bash`, the official
+xAI installer) rather than just erroring — confirm with `y` at the prompt,
+or install manually from <https://x.ai/cli> and re-run. Either way you'll
+still need to be logged in (a SuperGrok/X Premium+ subscription, or an
+`XAI_API_KEY`) — the launcher only handles getting the binary onto `PATH`.
 
 ## Dependencies
 
