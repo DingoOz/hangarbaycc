@@ -77,18 +77,25 @@
 # [HOST]. Then bind hangarbay-dictate.sh to a hotkey to talk into the Claude
 # Code prompt. See README.md "Voice dictation" for details.
 #
-# grok backend: launches xAI's Grok Build TUI (the `grok` CLI) INSTEAD OF
-# Claude Code, wired to the same local model grok-local.sh runs on ml-server
-# (Qwen3.6-35B-A3B via llama-server, fixed at :8081, 128K ctx, q8_0 KV — see
-# ~/Programming/grok-local/README.md on ml-server). Unlike grok-local.sh
-# (which runs the model AND the grok TUI both on ml-server), this backend
-# only starts/reuses the model server on ml-server over SSH, then runs `grok`
-# itself HERE, pointed at ml-server over the LAN — so you get the local
-# terminal/clipboard/editor integration while ml-server's GPU does the work.
-# Fixed host and fixed model config (no menu), same posture as meshllm above.
-# One-time client-side requirement: the `grok` CLI installed here; this
-# script adds a `[model.qwen36-mlserver]` entry to ~/.grok/config.toml
-# pointing at ml-server if one isn't already there.
+# grok backend (2 variants): launches xAI's Grok Build TUI (the `grok` CLI)
+# INSTEAD OF Claude Code, wired to a Qwen3.6-35B-A3B llama-server. No proxy
+# either way — llama-server already speaks OpenAI-compatible
+# /v1/chat/completions natively, and grok is a native OpenAI-compatible
+# client (unlike Claude Code, which needs hangarbaycc-proxy.py's
+# Anthropic<->OpenAI translation).
+#   4) Grok Build (ml-server)  model server is grok-local's own stack, fixed
+#      at :8081, 128K ctx, q8_0 KV, started/reused over SSH on ml-server (see
+#      ~/Programming/grok-local/README.md there). `grok` itself always runs
+#      HERE, talking to ml-server over the LAN.
+#   5) Grok Build (local)      model server is grok-local-server.sh (vendored
+#      into this repo from ~/ai-models/qwen3.6-35b-a3b/run.sh so there's no
+#      external script reference), fixed at :8080, 200K ctx, q8_0 KV, on THIS
+#      machine's own GPU — no SSH, no LAN dependency.
+# Either way, the first run against a given target adds a `[model.*]` entry
+# to ~/.grok/config.toml pointing at it (qwen36-mlserver / qwen36-local); if
+# the `grok` CLI itself isn't found on PATH, both variants offer to install
+# it (see ensure_grok_cli below), the same posture as the meshllm classifier
+# host's Ollama auto-install.
 #
 set -euo pipefail
 
@@ -135,13 +142,15 @@ echo "  3) meshllm, no classifier   (same, but skips the auto-mode safety-classi
 echo "                              startup; Bash/Edit/Write auto-approval falls back to a normal"
 echo "                              interactive y/n prompt instead — see the classifier comment below)"
 echo "  4) Grok Build          (grok CLI instead of Claude Code; model runs on ml-server, fixed config)"
-read -rp "Backend [1-4]: " BACKEND_CHOICE
+echo "  5) Grok Build (local)  (same, but model server runs on THIS machine only — no SSH/LAN)"
+read -rp "Backend [1-5]: " BACKEND_CHOICE
 MESHLLM_SKIP_CLASSIFIER=""
 case "$BACKEND_CHOICE" in
   1) BACKEND="ollama" ;;
   2) BACKEND="meshllm" ;;
   3) BACKEND="meshllm"; MESHLLM_SKIP_CLASSIFIER="1" ;;
   4) BACKEND="grok" ;;
+  5) BACKEND="grok-local" ;;
   *) echo "!! Invalid backend choice: $BACKEND_CHOICE" >&2; exit 1 ;;
 esac
 
@@ -199,6 +208,37 @@ remote_exec_tty() {
 remote_script() {
   local host="$1"
   if [[ -n "$host" ]]; then ssh "$host" bash -s; else bash -s; fi
+}
+
+# Shared by both grok backends (4 and 5, both run `grok` on THIS machine
+# regardless of where the model server lives). Same posture as the meshllm
+# classifier host's Ollama auto-install below: offer to install rather than
+# just erroring, but — unlike that SSH/non-interactive install — ask first,
+# since this runs in this interactive terminal and installs a new CLI tool
+# for the calling user rather than provisioning a dedicated remote host.
+ensure_grok_cli() {
+  if command -v grok >/dev/null 2>&1; then
+    return 0
+  fi
+  echo ">> 'grok' (Grok Build CLI) not found on PATH."
+  read -rp "Install it now (curl -fsSL https://x.ai/cli/install.sh | bash)? [y/N]: " GROK_INSTALL_CONFIRM
+  if [[ ! "$GROK_INSTALL_CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "!! Grok Build CLI is required for this backend — aborting." >&2
+    echo "!! Install manually: https://x.ai/cli" >&2
+    exit 1
+  fi
+  echo ">> Installing Grok Build CLI..."
+  if ! curl -fsSL https://x.ai/cli/install.sh | bash; then
+    echo "!! Install failed. Install manually: https://x.ai/cli" >&2
+    exit 1
+  fi
+  hash -r   # forget any cached "not found" lookup for `grok` in this shell
+  if ! command -v grok >/dev/null 2>&1; then
+    echo "!! 'grok' still not on PATH after install — check the installer's target dir" >&2
+    echo "!! (often ~/.local/bin) is on PATH, open a new shell, and re-run." >&2
+    exit 1
+  fi
+  echo ">> Grok Build CLI installed: $(command -v grok)"
 }
 
 # `ollama launch claude` sets CLAUDE_CODE_SUBAGENT_MODEL to EMPTY. Claude's logic
@@ -635,10 +675,7 @@ EOF
   # Only [model.*] sections in ~/.grok/config.toml are read (project-scoped
   # .grok/config.toml only supports [mcp_servers]), so this must be global.
   GROK_CONFIG="$HOME/.grok/config.toml"
-  if ! command -v grok >/dev/null 2>&1; then
-    echo "!! 'grok' not found on PATH on this machine — install Grok Build here first." >&2
-    exit 1
-  fi
+  ensure_grok_cli
   mkdir -p "$(dirname "$GROK_CONFIG")"
   touch "$GROK_CONFIG"
   if grep -q "^\[model\.${GROK_MODEL_ID}\]" "$GROK_CONFIG" 2>/dev/null; then
@@ -663,6 +700,87 @@ EOF
   fi
 
   echo ">> Launching Grok Build against ${GROK_SSH_HOST} (model server left running afterward — stays warm)..."
+  exec grok -m "$GROK_MODEL_ID" --disable-web-search
+fi
+
+# --- grok-local backend --------------------------------------------------------
+# Same as the grok backend above, except the model server is
+# grok-local-server.sh (vendored into this repo, not an external script
+# reference) running on THIS machine's own GPU — no SSH, no LAN dependency.
+# See the header comment near the top of the file for the full picture.
+if [[ "$BACKEND" == "grok-local" ]]; then
+  [[ -n "$REMOTE" || -n "$DICTATE" ]] && \
+    echo "!! --remote/--dictate don't apply to the grok-local backend (this machine only); ignoring." >&2
+
+  GROK_PORT=8080
+  GROK_BASE="http://127.0.0.1:${GROK_PORT}"
+  GROK_SERVER_SCRIPT="$SCRIPT_DIR/grok-local-server.sh"
+  GROK_MODEL_DIR="${GROK_LOCAL_MODEL_DIR:-$HOME/ai-models/qwen3.6-35b-a3b}"
+  GROK_MODEL_ID="qwen36-local"   # distinct from ml-server's "qwen36-mlserver"
+  GROK_CTX=200000   # matches grok-local-server.sh's -c flag
+
+  echo ">> Backend: Grok Build (local) | Model: Qwen3.6-35B-A3B on this machine (${GROK_BASE})"
+
+  if ! nvidia-smi >/dev/null 2>&1; then
+    echo "!! GPU unavailable on this machine (nvidia-smi failed)." >&2
+    echo "!! Reboot / reset the driver first." >&2
+    exit 1
+  fi
+
+  if curl -sf -m 3 "${GROK_BASE}/health" >/dev/null 2>&1; then
+    echo ">> Model server already up on 127.0.0.1:${GROK_PORT} — reusing it."
+  else
+    echo ">> Model server not up — starting it..."
+    if [[ ! -x "$GROK_SERVER_SCRIPT" ]]; then
+      echo "!! $GROK_SERVER_SCRIPT not found or not executable." >&2
+      exit 1
+    fi
+    if [[ ! -f "$GROK_MODEL_DIR/Qwen3.6-35B-A3B-UD-Q5_K_XL.gguf" ]]; then
+      echo "!! Model gguf not found in $GROK_MODEL_DIR." >&2
+      echo "!! Set GROK_LOCAL_MODEL_DIR if your weights live elsewhere." >&2
+      exit 1
+    fi
+    # Port may be occupied by a stale/unhealthy process from a prior crashed
+    # run (the health check above already ruled out a *healthy* server) —
+    # clear it before starting, same posture as the Ollama backend's stop step.
+    fuser -k "${GROK_PORT}/tcp" 2>/dev/null || true
+    sleep 1
+    GROK_LOCAL_MODEL_DIR="$GROK_MODEL_DIR" setsid nohup "$GROK_SERVER_SCRIPT" \
+      >/tmp/hangarbaycc-grok-local.log 2>&1 </dev/null &
+    disown
+    wait_for_http "${GROK_BASE}/health" "Check /tmp/hangarbaycc-grok-local.log."
+    echo ">> Model server ready on 127.0.0.1:${GROK_PORT}."
+  fi
+
+  # Client-side: register the model with grok's config if it isn't there yet.
+  # Only [model.*] sections in ~/.grok/config.toml are read (project-scoped
+  # .grok/config.toml only supports [mcp_servers]), so this must be global.
+  GROK_CONFIG="$HOME/.grok/config.toml"
+  ensure_grok_cli
+  mkdir -p "$(dirname "$GROK_CONFIG")"
+  touch "$GROK_CONFIG"
+  if grep -q "^\[model\.${GROK_MODEL_ID}\]" "$GROK_CONFIG" 2>/dev/null; then
+    echo ">> Model '$GROK_MODEL_ID' already configured in $GROK_CONFIG."
+  else
+    echo ">> Adding model '$GROK_MODEL_ID' to $GROK_CONFIG (points at ${GROK_BASE})..."
+    cat >>"$GROK_CONFIG" <<EOF
+
+[model.${GROK_MODEL_ID}]
+model = "${GROK_MODEL_ID}"
+base_url = "${GROK_BASE}/v1"
+name = "Qwen3.6-35B-A3B (local)"
+description = "grok-local-server.sh's llama-server, on this machine's own GPU"
+api_key = "local"
+api_backend = "chat_completions"
+temperature = 0.7
+top_p = 0.95
+max_completion_tokens = 8192
+context_window = ${GROK_CTX}
+stream_tool_calls = false
+EOF
+  fi
+
+  echo ">> Launching Grok Build locally (model server left running afterward — stays warm)..."
   exec grok -m "$GROK_MODEL_ID" --disable-web-search
 fi
 
