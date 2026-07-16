@@ -1,4 +1,7 @@
 add_executable(hangarbaycc src/main.cpp)
 
-# Link with core and platform libraries
-target_link_libraries(hangarbaycc PRIVATE core platform)
+# Find SDL2 and required components
+find_package(SDL2 REQUIRED)
+
+# Link with core, platform libraries and SDL components
+    target_link_libraries(hangarbaycc PRIVATE core platform ${SDL2_LIBRARIES} SDL2_image SDL2_mixer)

@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cmath>
 #include <vector>
+#include <cstdlib>
+#include <algorithm>
 
 namespace hangarbay {
 
@@ -23,6 +25,14 @@ struct Bullet {
     float y{0.f};
 };
 
+// Simple enemy representation
+struct Enemy {
+    float x{0.f};
+    float y{0.f};
+    int type{0}; // 0: goblin, 1: orc, 2: dragon
+    int health{3};
+};
+
 struct GameState {
     float playerX{SCREEN_WIDTH / 2.f};
     float playerY{SCREEN_HEIGHT - 50.f}; // start near bottom
@@ -31,6 +41,8 @@ struct GameState {
     static constexpr float PLAYER_SPEED = 200.f; // units per second
     static constexpr float SCROLL_SPEED = 100.f; // units per second
     static constexpr float FIRE_RATE = 5.0f; // shots per second
+    static constexpr float BULLET_SPEED = 400.f;
+    static constexpr float ENEMY_SPEED = 80.f;
 
     std::vector<Bullet> bullets;
     float timeSinceLastShot{0.f};
@@ -51,6 +63,17 @@ struct GameState {
         if (expansionLevel < MAX_EXPANSION_LEVEL)
             ++expansionLevel;
     }
+
+    std::vector<Enemy> enemies;
+    int score{0};
+    int lives{3};
+
+    // Spawn an enemy at world coordinates
+    void spawnEnemy(int type, float x, float y) {
+        Enemy e; e.type = type; e.x = x; e.y = y; e.health = 3;
+        enemies.push_back(e);
+    }
+
     void update(float dt, const Input& input) {
         // apply scrolling
         scrollOffset += SCROLL_SPEED * dt;
@@ -84,15 +107,70 @@ struct GameState {
             bullets.push_back({playerX, playerY});
             timeSinceLastShot = 0.f;
         }
-    }
 
-    int bombsRemaining{3};
-    void activateSmartBomb() {
-        if (bombsRemaining > 0) {
-            // placeholder: clearing logic will be added later
-            --bombsRemaining;
+        // move bullets
+        for (auto it = bullets.begin(); it != bullets.end();) {
+            it->y -= BULLET_SPEED * dt;
+            if (it->y < 0) {
+                it = bullets.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // move enemies and check collision with player
+        for (auto eit = enemies.begin(); eit != enemies.end();) {
+            eit->x -= ENEMY_SPEED * dt;
+            // simple AABB collision between enemy and player
+            bool hitPlayer = (
+                std::abs(eit->x - playerX) < 16.f &&
+                std::abs(eit->y - playerY) < 16.f
+            );
+            if (hitPlayer) {
+                // reduce life and remove enemy
+                lives--;
+                eit = enemies.erase(eit);
+                continue;
+            }
+            // remove off-screen left
+            if (eit->x < -32.f) {
+                eit = enemies.erase(eit);
+                continue;
+            }
+            ++eit;
+        }
+
+        // collision between bullets and enemies
+        for (auto bIt = bullets.begin(); bIt != bullets.end();) {
+            bool bulletRemoved = false;
+            for (auto eIt = enemies.begin(); eIt != enemies.end() && !bulletRemoved;) {
+                if (
+                    std::abs(bIt->x - eIt->x) < 16.f &&
+                    std::abs(bIt->y - eIt->y) < 16.f
+                ) {
+                    // hit enemy
+                    eIt->health--;
+                    if (eIt->health <= 0) {
+                        score += 10; // arbitrary points per kill
+                        enemies.erase(eIt);
+                    } else {
+                        ++eIt;
+                    }
+                    bulletRemoved = true;
+                } else {
+                    ++eIt;
+                }
+            }
+            if (bulletRemoved) {
+                bIt = bullets.erase(bIt);
+            } else {
+                ++bIt;
+            }
         }
     }
+
+    int characterSelection{0}; // 0: default, 1/2/3 for other types
+
 };
 
 } // namespace hangarbay

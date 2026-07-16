@@ -77,6 +77,19 @@
 # [HOST]. Then bind hangarbay-dictate.sh to a hotkey to talk into the Claude
 # Code prompt. See README.md "Voice dictation" for details.
 #
+# grok backend: launches xAI's Grok Build TUI (the `grok` CLI) INSTEAD OF
+# Claude Code, wired to the same local model grok-local.sh runs on ml-server
+# (Qwen3.6-35B-A3B via llama-server, fixed at :8081, 128K ctx, q8_0 KV — see
+# ~/Programming/grok-local/README.md on ml-server). Unlike grok-local.sh
+# (which runs the model AND the grok TUI both on ml-server), this backend
+# only starts/reuses the model server on ml-server over SSH, then runs `grok`
+# itself HERE, pointed at ml-server over the LAN — so you get the local
+# terminal/clipboard/editor integration while ml-server's GPU does the work.
+# Fixed host and fixed model config (no menu), same posture as meshllm above.
+# One-time client-side requirement: the `grok` CLI installed here; this
+# script adds a `[model.qwen36-mlserver]` entry to ~/.grok/config.toml
+# pointing at ml-server if one isn't already there.
+#
 set -euo pipefail
 
 usage() {
@@ -116,12 +129,19 @@ DICTATE="${DICTATE:-${HANGARBAY_DICTATE:-}}"
 
 # --- backend selection ----------------------------------------------------
 echo "Select backend:"
-echo "  1) Ollama    (local model — this machine or --remote; model/context/KV menus)"
-echo "  2) meshllm   (LAN mesh-llm server, always-on, fixed config)"
-read -rp "Backend [1-2]: " BACKEND_CHOICE
+echo "  1) Ollama              (local model — this machine or --remote; model/context/KV menus)"
+echo "  2) meshllm             (LAN mesh-llm server, always-on, fixed config)"
+echo "  3) meshllm, no classifier   (same, but skips the auto-mode safety-classifier host — faster"
+echo "                              startup; Bash/Edit/Write auto-approval falls back to a normal"
+echo "                              interactive y/n prompt instead — see the classifier comment below)"
+echo "  4) Grok Build          (grok CLI instead of Claude Code; model runs on ml-server, fixed config)"
+read -rp "Backend [1-4]: " BACKEND_CHOICE
+MESHLLM_SKIP_CLASSIFIER=""
 case "$BACKEND_CHOICE" in
   1) BACKEND="ollama" ;;
   2) BACKEND="meshllm" ;;
+  3) BACKEND="meshllm"; MESHLLM_SKIP_CLASSIFIER="1" ;;
+  4) BACKEND="grok" ;;
   *) echo "!! Invalid backend choice: $BACKEND_CHOICE" >&2; exit 1 ;;
 esac
 
@@ -215,18 +235,147 @@ if [[ "$BACKEND" == "meshllm" ]]; then
 
   MESHLLM_HOST="192.168.1.16:9337"
   MESHLLM_BASE="http://${MESHLLM_HOST}/v1"
-  MODEL="meshllm/Qwen3-30B-A3B-Q4_K_M-layers"
+
+  echo "Select mesh-llm model:"
+  echo "  1) Qwen3-30B-A3B-Q4_K_M-layers   (MoE, 48 layers, split ml-server+rtx3070 — current default)"
+  echo "  2) Qwen3-8B-Q4_K_M-layers        (smaller dense model, same split topology)"
+  read -rp "Model [1-2, default 1]: " MESHLLM_MODEL_CHOICE
+  case "${MESHLLM_MODEL_CHOICE:-1}" in
+    1) MESHLLM_MODEL_REF="Qwen3-30B-A3B-Q4_K_M-layers" ;;
+    2) MESHLLM_MODEL_REF="Qwen3-8B-Q4_K_M-layers" ;;
+    *) echo "!! Invalid model choice: $MESHLLM_MODEL_CHOICE" >&2; exit 1 ;;
+  esac
+  MODEL="meshllm/${MESHLLM_MODEL_REF}"
+
+  # 40960 is mesh-llm/skippy's ctx_size — confirmed via the GGUF metadata to
+  # be the native context for BOTH catalog models above, so this doesn't need
+  # to vary by selection. It IS, however, one shared KV cache divided evenly
+  # across however many concurrent "lanes" (skippy's llama.cpp-style
+  # parallel-slot count) are configured — live-confirmed via ml-server's own
+  # console API (curl http://127.0.0.1:3131/api/status) as lane_count=4 in
+  # production, meaning a single session's real budget is ~40960/4≈10240
+  # tokens, NOT the full 40960 this NUM_CTX claims. No CLI flag for lane
+  # count was found in `mesh-llm --help-advanced` (0.73.1) to bring it down
+  # to 1 — this mismatch is a known, NOT-yet-fixed gap (a prior comment here
+  # incorrectly claimed lane_count=1 was already deliberately configured;
+  # that was never actually implemented, since no lever for it exists yet).
+  # Until resolved, treat compaction/rejection near the true ~10240-token
+  # ceiling as expected, not a bug.
   NUM_CTX=40960
   TEMP_FLOOR=0.7; TEMP_CEIL=0.85; TOP_P_CEIL=1.0   # no established guidance yet; easy to tune
   PROXY_PORT="${PROXY_HOST##*:}"
 
-  echo ">> Checking meshllm reachability at $MESHLLM_BASE ..."
-  if ! curl -sf -m 5 "$MESHLLM_BASE/models" >/dev/null; then
-    echo "!! meshllm server unreachable at $MESHLLM_BASE." >&2
-    echo "!! No HA/failover — depends on BOTH ml-server (mesh-llm process) and" >&2
-    echo "!! rtx3070 (Docker container) staying up. Check both." >&2
-    exit 1
-  fi
+  # --- mesh-llm cluster control (ml-server coordinator + rtx3070 worker) ----
+  # The "-layers" catalog build only forms a split when BOTH nodes are
+  # serving the exact same model reference (see mesh-llm-setup.md on
+  # ml-server) — there's no way to hot-swap the model on a running instance,
+  # so switching models means stopping and restarting mesh-llm on BOTH hosts.
+  MESHLLM_COORD_SSH="ml-server"
+  MESHLLM_COORD_IP="192.168.1.16"
+  MESHLLM_WORKER_SSH="rtx3070"
+  MESHLLM_WORKER_IP="192.168.1.193"
+  # ml-server's node identity (~/.mesh-llm/mesh-id and its keypair) persists
+  # across restarts unless `mesh-llm rotate-key` is run there, so this join
+  # token (ml-server's node id + LAN address, from mesh-llm-setup.md) keeps
+  # working across model switches without needing to be regenerated each
+  # time. If joining ever starts failing, check whether that identity was
+  # rotated and pull a fresh token from ml-server (its console API's
+  # /api/status "token" field, or the serve command's own startup output).
+  MESHLLM_JOIN_TOKEN="eyJpZCI6ImY5MTE1YzE2MmI1NjdmOGYwZTM1N2FmYWU2ODdlNjAyN2Y2N2JkMjM5NmIzYTcwZGI5NDA5Yjk0ZDkyYzQzN2MiLCJhZGRycyI6W3siSXAiOiIxOTIuMTY4LjEuMTY6Nzg0MiJ9XX0"
+
+  # /v1/models' single entry's `id` is the model currently being served —
+  # empty string (rather than erroring) if unreachable or the response
+  # doesn't parse, so callers can just compare against "$MODEL".
+  meshllm_current_model() {
+    curl -sf -m 5 "$MESHLLM_BASE/models" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin)["data"][0]["id"])
+except Exception:
+    pass
+' 2>/dev/null
+  }
+
+  ensure_meshllm_model() {
+    local want="$1" current
+    current="$(meshllm_current_model)"
+
+    if [[ "$current" == "$want" ]]; then
+      echo ">> mesh-llm already serving $want — skipping restart."
+      return 0
+    fi
+
+    echo ">> mesh-llm is currently serving '${current:-<unreachable>}', not '$want'."
+    echo ">> Switching models restarts the SHARED mesh-llm service on both"
+    echo ">> $MESHLLM_COORD_SSH and $MESHLLM_WORKER_SSH — anyone else mid-request"
+    echo ">> against it right now (inflight requests, if any) will be interrupted."
+    read -rp "Proceed with the switch? [y/N]: " MESHLLM_CONFIRM_SWITCH
+    [[ "$MESHLLM_CONFIRM_SWITCH" =~ ^[Yy]$ ]] || { echo "!! Aborting." >&2; exit 1; }
+
+    if ! ssh -o ConnectTimeout=5 "$MESHLLM_COORD_SSH" true; then
+      echo "!! Could not reach '$MESHLLM_COORD_SSH' over SSH." >&2
+      exit 1
+    fi
+    if ! ssh -o ConnectTimeout=5 "$MESHLLM_WORKER_SSH" true; then
+      echo "!! Could not reach '$MESHLLM_WORKER_SSH' over SSH." >&2
+      exit 1
+    fi
+
+    echo ">> Stopping mesh-llm on $MESHLLM_COORD_SSH..."
+    remote_exec "$MESHLLM_COORD_SSH" '~/stop-mesh-llm.sh' || true
+
+    echo ">> Stopping mesh-llm-node container on $MESHLLM_WORKER_SSH..."
+    remote_exec "$MESHLLM_WORKER_SSH" \
+      'docker stop mesh-llm-node >/dev/null 2>&1 || true; docker rm mesh-llm-node >/dev/null 2>&1 || true'
+
+    # Not backgrounded via a service manager on ml-server today (it normally
+    # runs attached to whoever's terminal started it) — setsid+nohup+disown
+    # detaches it from this SSH session the same way the classifier-host
+    # bring-up above does, so it survives after we disconnect.
+    echo ">> Starting mesh-llm on $MESHLLM_COORD_SSH with $want..."
+    remote_script "$MESHLLM_COORD_SSH" <<EOF
+setsid nohup ~/start-mesh-llm.sh serve --model $want --split --max-vram 15 \
+  --bind-ip $MESHLLM_COORD_IP --bind-port 7842 --mesh-discovery-mode mdns --listen-all \
+  >/tmp/mesh-llm-coordinator.log 2>&1 </dev/null &
+disown
+EOF
+    wait_for_http "http://${MESHLLM_COORD_IP}:9337/v1/models" \
+      "Check /tmp/mesh-llm-coordinator.log on $MESHLLM_COORD_SSH."
+
+    echo ">> Starting mesh-llm-node container on $MESHLLM_WORKER_SSH with $want..."
+    remote_script "$MESHLLM_WORKER_SSH" <<EOF
+docker run -d \
+  --name mesh-llm-node \
+  --network host \
+  --restart unless-stopped \
+  --gpus all \
+  -v /home/dingo/mesh-llm-remote-home:/root \
+  -v /home/dingo/.local/bin/mesh-llm:/usr/local/bin/mesh-llm:ro \
+  mesh-llm-base:latest \
+  mesh-llm serve --model $want --split --max-vram 7 \
+    --join $MESHLLM_JOIN_TOKEN \
+    --bind-ip $MESHLLM_WORKER_IP --bind-port 7843 --port 9337 --console 3131 \
+    --mesh-discovery-mode mdns --log-format json --listen-all
+EOF
+
+    echo ">> Waiting for the mesh-llm split to form and report '$want' (this can take a"
+    echo ">> while the first time a model is selected — rtx3070 may need to download its"
+    echo ">> share of layers from Hugging Face)..."
+    local tries=150   # up to 5 min: cold weight download + split-plan formation
+    until [[ "$(meshllm_current_model)" == "$want" ]]; do
+      tries=$((tries - 1))
+      if [[ $tries -le 0 ]]; then
+        echo "!! Timed out waiting for mesh-llm to report '$want'." >&2
+        echo "!! Check /tmp/mesh-llm-coordinator.log on $MESHLLM_COORD_SSH and" >&2
+        echo "!! 'ssh $MESHLLM_WORKER_SSH docker logs mesh-llm-node' for split-formation errors." >&2
+        exit 1
+      fi
+      sleep 2
+    done
+    echo ">> mesh-llm now serving $want."
+  }
+
+  ensure_meshllm_model "$MODEL"
 
   LAUNCH_SETTINGS="$(build_launch_settings)"
 
@@ -320,7 +469,11 @@ EOF
       "Check /tmp/ollama-classifier.log on ${CLASSIFIER_SSH_HOST}, and that its firewall allows port 11434 from this LAN." soft
   }
 
-  if ! ensure_classifier_server; then
+  if [[ -n "$MESHLLM_SKIP_CLASSIFIER" ]]; then
+    echo ">> Skipping classifier setup (menu choice) — auto-mode Bash/Edit/Write checks may be" >&2
+    echo ">> slow/unreliable against meshllm; see the classifier comment above for why." >&2
+    CLASSIFIER_MODEL=""
+  elif ! ensure_classifier_server; then
     echo "!! Continuing without a classifier override (auto-mode Bash/Edit/Write checks may be slow/unreliable)." >&2
     CLASSIFIER_MODEL=""
   fi
@@ -380,6 +533,20 @@ EOF
   echo ">> Backend: meshllm | Model: $MODEL | Context: $NUM_CTX | temp band: [$TEMP_FLOOR, $TEMP_CEIL]"
   echo ">> Auto-compact window: $NUM_CTX (matches server context; /context headline still shows 200k — cosmetic)"
 
+  # Without a classifier override, auto-mode's safety-classifier call still
+  # fires (its hardcoded "claude-sonnet-5" target isn't rewritten by the
+  # proxy — see CLASSIFIER_MODEL comment above), requests a model that
+  # doesn't exist on meshllm, and HARD-FAILS every non-allowlisted
+  # Bash/Edit/Write call rather than degrading gracefully. --permission-mode
+  # manual sidesteps auto-mode's classifier gate entirely, falling back to a
+  # normal interactive y/n prompt for anything not covered by an explicit
+  # allow/deny rule — the tradeoff for skipping the classifier host is
+  # "ask me every time", not "broken".
+  CLAUDE_EXTRA_ARGS=()
+  if [[ -n "$MESHLLM_SKIP_CLASSIFIER" ]]; then
+    CLAUDE_EXTRA_ARGS+=(--permission-mode manual)
+  fi
+
   # No `ollama launch claude` here — that subcommand tries to pull MODEL from
   # the Ollama registry and fails outright for a non-Ollama model name. claude
   # itself honours ANTHROPIC_BASE_URL/ANTHROPIC_MODEL/ANTHROPIC_AUTH_TOKEN
@@ -392,15 +559,111 @@ EOF
     echo ">> Stripping tools at the proxy (and auto-denying as backstop): ${MESHLLM_STRIP_TOOLS[*]}"
     claude --settings "$LAUNCH_SETTINGS" \
       --append-system-prompt "$(cat "$EDIT_RULES")" \
-      --disallowedTools "${MESHLLM_STRIP_TOOLS[@]}"
+      --disallowedTools "${MESHLLM_STRIP_TOOLS[@]}" \
+      "${CLAUDE_EXTRA_ARGS[@]}"
   else
     echo "!! $EDIT_RULES not found — launching without the editing-rules prompt." >&2
     echo ">> Stripping tools at the proxy (and auto-denying as backstop): ${MESHLLM_STRIP_TOOLS[*]}"
-    claude --settings "$LAUNCH_SETTINGS" --disallowedTools "${MESHLLM_STRIP_TOOLS[@]}"
+    claude --settings "$LAUNCH_SETTINGS" --disallowedTools "${MESHLLM_STRIP_TOOLS[@]}" "${CLAUDE_EXTRA_ARGS[@]}"
   fi
 
   echo ">> Session over. Translation proxy stopped. meshllm is always-on — nothing to leave warm here."
   exit 0
+fi
+
+# --- grok backend ------------------------------------------------------------
+# Launches xAI's Grok Build TUI instead of Claude Code. The model server is
+# grok-local's own stack (llama-server serving Qwen3.6-35B-A3B) started/reused
+# on ml-server over SSH; `grok` itself runs on THIS machine, talking to
+# ml-server over the LAN — no proxy involved, since llama-server already
+# speaks OpenAI-compatible /v1/chat/completions natively and grok is a native
+# OpenAI-compatible client (unlike Claude Code, which needs
+# hangarbaycc-proxy.py's Anthropic<->OpenAI translation).
+if [[ "$BACKEND" == "grok" ]]; then
+  [[ -n "$REMOTE" || -n "$DICTATE" ]] && \
+    echo "!! --remote/--dictate don't apply to the grok backend (fixed ml-server endpoint); ignoring." >&2
+
+  # Same host as the meshllm coordinator above, but a different service (grok-local's
+  # llama-server, not mesh-llm) and a different port. IP hardcoded rather than
+  # resolved from the 'ml-server' ssh alias, matching the MESHLLM_COORD_IP
+  # convention above — ssh aliases aren't guaranteed resolvable for plain HTTP.
+  GROK_SSH_HOST="ml-server"
+  GROK_HOST_IP="192.168.1.16"
+  GROK_PORT=8081
+  GROK_BASE="http://${GROK_HOST_IP}:${GROK_PORT}"
+  GROK_REMOTE_ROOT='$HOME/Programming/grok-local'   # single-quoted: expanded on the TARGET host
+  GROK_MODEL_ID="qwen36-mlserver"   # distinct from ml-server's own local-loopback config's "qwen36-local"
+
+  echo ">> Backend: Grok Build | Model: Qwen3.6-35B-A3B on ${GROK_SSH_HOST} (${GROK_BASE})"
+
+  if ! ssh -o ConnectTimeout=5 "$GROK_SSH_HOST" true; then
+    echo "!! Could not reach '$GROK_SSH_HOST' over SSH." >&2
+    exit 1
+  fi
+
+  if ! remote_exec "$GROK_SSH_HOST" "nvidia-smi >/dev/null 2>&1"; then
+    echo "!! GPU unavailable on ${GROK_SSH_HOST} (nvidia-smi failed)." >&2
+    exit 1
+  fi
+
+  if curl -sf -m 3 "${GROK_BASE}/health" >/dev/null 2>&1; then
+    echo ">> Model server already up on ${GROK_SSH_HOST}:${GROK_PORT} — reusing it."
+  else
+    echo ">> Model server not up — starting it on ${GROK_SSH_HOST}..."
+    if ! remote_exec "$GROK_SSH_HOST" "test -f ${GROK_REMOTE_ROOT}/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"; then
+      echo "!! Model gguf not found in ${GROK_REMOTE_ROOT}/models on ${GROK_SSH_HOST}." >&2
+      echo "!! Download it there first: ${GROK_REMOTE_ROOT}/bin/download-qwen36.sh" >&2
+      exit 1
+    fi
+    # Port may be occupied by a stale/unhealthy process from a prior crashed
+    # run (the health check above already ruled out a *healthy* server) —
+    # clear it before starting, same posture as the Ollama backend's stop step.
+    remote_script "$GROK_SSH_HOST" <<EOF
+fuser -k ${GROK_PORT}/tcp 2>/dev/null || true
+sleep 1
+cd ${GROK_REMOTE_ROOT}
+mkdir -p models
+setsid nohup ./bin/run-qwen36-35b.sh --port ${GROK_PORT} >models/llama-server.log 2>&1 </dev/null &
+disown
+EOF
+    wait_for_http "${GROK_BASE}/health" \
+      "Check ${GROK_REMOTE_ROOT}/models/llama-server.log on ${GROK_SSH_HOST}."
+    echo ">> Model server ready on ${GROK_SSH_HOST}:${GROK_PORT}."
+  fi
+
+  # Client-side: register the model with grok's config if it isn't there yet.
+  # Only [model.*] sections in ~/.grok/config.toml are read (project-scoped
+  # .grok/config.toml only supports [mcp_servers]), so this must be global.
+  GROK_CONFIG="$HOME/.grok/config.toml"
+  if ! command -v grok >/dev/null 2>&1; then
+    echo "!! 'grok' not found on PATH on this machine — install Grok Build here first." >&2
+    exit 1
+  fi
+  mkdir -p "$(dirname "$GROK_CONFIG")"
+  touch "$GROK_CONFIG"
+  if grep -q "^\[model\.${GROK_MODEL_ID}\]" "$GROK_CONFIG" 2>/dev/null; then
+    echo ">> Model '$GROK_MODEL_ID' already configured in $GROK_CONFIG."
+  else
+    echo ">> Adding model '$GROK_MODEL_ID' to $GROK_CONFIG (points at ${GROK_BASE})..."
+    cat >>"$GROK_CONFIG" <<EOF
+
+[model.${GROK_MODEL_ID}]
+model = "qwen36-mlserver"
+base_url = "${GROK_BASE}/v1"
+name = "Qwen3.6-35B-A3B (ml-server, LAN)"
+description = "grok-local's llama-server on ml-server, reached over the LAN"
+api_key = "local"
+api_backend = "chat_completions"
+temperature = 0.7
+top_p = 0.95
+max_completion_tokens = 8192
+context_window = 131072
+stream_tool_calls = false
+EOF
+  fi
+
+  echo ">> Launching Grok Build against ${GROK_SSH_HOST} (model server left running afterward — stays warm)..."
+  exec grok -m "$GROK_MODEL_ID" --disable-web-search
 fi
 
 # --- Ollama backend ----------------------------------------------------------

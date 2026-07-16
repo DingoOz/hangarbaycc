@@ -195,6 +195,14 @@ CLASSIFIER_CONTEXT_BUDGET_BYTES = 48_000
 # for a second request over that same window. Only guards the meshllm leg
 # (PROTOCOL=="openai"); the classifier goes to a different host and doesn't
 # contend with meshllm, and Ollama-protocol mode has never shown this issue.
+#
+# The mutex is justified by that live-observed behavior alone, not by any
+# lane_count assumption — mesh-llm is actually configured with lane_count=4
+# (see the NUM_CTX comment in hangarbaycc.sh's meshllm block), yet requests
+# still serialize with immediate 429s as described above. So lane_count
+# isn't the lever that would unlock real concurrency here; until whatever
+# is actually forcing single-flight is understood, keep this as a hard
+# mutex rather than a Semaphore(lane_count).
 UPSTREAM_LOCK = threading.Lock()
 
 # Headers that must not be copied between hops.

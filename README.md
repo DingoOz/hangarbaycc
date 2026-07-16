@@ -307,6 +307,37 @@ cost isn't paid again); the next launch's cleanup step kills any stale
 instance before starting a fresh one. Stop it by hand with:
 `ssh ml-server pkill -x whisper-server`.
 
+## Grok Build backend
+
+Backend option 4 launches [Grok Build](https://x.ai) (the `grok` CLI) instead
+of Claude Code, wired to the model `grok-local` — really just a set of
+scripts in `~/Programming/grok-local` on `ml-server` — runs: `llama-server`
+serving Qwen3.6-35B-A3B, fixed at `:8081`, 128K context, `q8_0` KV,
+`n-cpu-moe 20`.
+
+Unlike `grok-local.sh` (which runs both the model *and* the `grok` TUI on
+ml-server), this backend only starts/reuses the model server on ml-server
+over SSH; `grok` itself runs on the machine you launch `hangarbaycc.sh` from,
+talking to ml-server over the LAN. No proxy is involved — `llama-server`
+already speaks OpenAI-compatible `/v1/chat/completions` natively, and `grok`
+is a native OpenAI-compatible client (unlike Claude Code, which needs
+`hangarbaycc-proxy.py`'s Anthropic-to-OpenAI translation).
+
+Fixed host, fixed model config — same posture as meshllm above, no
+model/context/KV menus. The first run adds a `[model.qwen36-mlserver]` entry
+to your `~/.grok/config.toml` pointing at `http://192.168.1.16:8081/v1`
+(only `~/.grok/config.toml` is read for model definitions — project-scoped
+`.grok/config.toml` only supports `[mcp_servers]`); later runs reuse it.
+
+If the model server isn't already up, it takes a while to load (a 35B MoE on
+one consumer GPU) — the launcher polls `/health` until it answers, same as
+the Ollama backend's wait step. Left running afterward so it stays warm for
+the next launch, same as Ollama.
+
+**Requires:** the `grok` CLI installed and logged in on the client machine,
+and the model already downloaded on ml-server
+(`~/Programming/grok-local/bin/download-qwen36.sh` if not).
+
 ## Dependencies
 
 Everything the launcher shells out to. On a single-machine setup all of these
