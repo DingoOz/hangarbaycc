@@ -4,7 +4,7 @@
 # a pass/fail scorecard.
 #
 # Usage:
-#   bench/run-bench.sh MODEL [HOSTPORT]
+#   bench/run-bench.sh MODEL [HOSTPORT] [TASKSET]
 #
 #   MODEL     e.g. ornith:latest, gpt-oss:20b (must be loadable by the server),
 #             or meshllm/Qwen3-30B-A3B-Q4_K_M-layers for the LAN meshllm server.
@@ -12,6 +12,9 @@
 #             the model's own sampling). Point it at 127.0.0.1:11435 instead to
 #             bench THROUGH the temp proxy and measure a temp band. For meshllm,
 #             pass its host:port, e.g. 192.168.1.16:9337.
+#   TASKSET   subdirectory of bench/ holding the tasks. Default 'tasks' (the
+#             quick 8-task set); 'tasks-hard' is the harder tier (multi-case
+#             checkers, sanitizers, exact error messages).
 #
 #   Protocol is auto-detected from MODEL: a `meshllm/` prefix means an
 #   OpenAI-compatible /v1/chat/completions endpoint; anything else assumes
@@ -26,14 +29,17 @@
 #
 set -uo pipefail
 
-MODEL="${1:?usage: run-bench.sh MODEL [HOSTPORT]}"
+MODEL="${1:?usage: run-bench.sh MODEL [HOSTPORT] [TASKSET]}"
 HOSTPORT="${2:-127.0.0.1:11434}"
+TASKSET="${3:-tasks}"
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TASKS_DIR="$BENCH_DIR/tasks"
+TASKS_DIR="$BENCH_DIR/$TASKSET"
+[[ -d "$TASKS_DIR" ]] || { echo "!! No task set at $TASKS_DIR" >&2; exit 1; }
 RESULTS_DIR="$BENCH_DIR/results"
 WORK="$(mktemp -d /tmp/hangarbaycc-bench.XXXXXX)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-OUT="$RESULTS_DIR/${MODEL//[:\/]/_}-$STAMP.md"
+SETTAG=""; [[ "$TASKSET" != "tasks" ]] && SETTAG="-$TASKSET"
+OUT="$RESULTS_DIR/${MODEL//[:\/]/_}${SETTAG}-$STAMP.md"
 mkdir -p "$RESULTS_DIR"
 
 PROTO="anthropic"
@@ -54,6 +60,7 @@ fi
 echo "# hangarbaycc-bench: $MODEL" > "$OUT"
 {
   echo ""
+  echo "- task set: \`$TASKSET\`"
   echo "- endpoint: \`$HOSTPORT\`"
   echo "- date: $(date -Is)"
   echo "- bench shell env: ctx=${OLLAMA_CONTEXT_LENGTH:-?} kv=${OLLAMA_KV_CACHE_TYPE:-?} (server may differ if launched elsewhere)"

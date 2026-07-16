@@ -58,9 +58,11 @@
 # (qwen3-coder:30b was dropped: ~18 GB weights exceed 16 GB VRAM, so it spills
 #  to CPU at every context/KV setting and runs CPU-bound. Not offered here.)
 #
-# On launch you pick the model, context window, and KV cache precision. The
-# preload guard aborts on a CPU spill; if it triggers, re-run with a smaller
-# context and/or more compressed KV cache.
+# On launch you pick the model, context window, and KV cache precision. If
+# ollama isn't installed on the target host you're offered the official
+# installer; if the chosen model isn't in either model store you're offered an
+# `ollama pull`. The preload guard aborts on a CPU spill; if it triggers,
+# re-run with a smaller context and/or more compressed KV cache.
 #
 # meshllm backend: a fixed remote model (currently
 # meshllm/Qwen3-30B-A3B-Q4_K_M-layers at 192.168.1.16:9337, 40960 native
@@ -817,6 +819,31 @@ if [[ -n "$REMOTE" ]]; then
   fi
 fi
 
+# --- Ollama must be installed on the target host -------------------------------
+# If it isn't, offer to run the official installer there. The installer needs
+# sudo (it installs the binary and a systemd service), hence remote_exec_tty.
+# The service it starts is harmless — step 1 below stops it before launching
+# our own configured `ollama serve`.
+if ! remote_exec "$REMOTE" 'command -v ollama >/dev/null 2>&1'; then
+  echo "!! Ollama is not installed on ${SERVER_LABEL}."
+  read -rp "Install it now via the official script (curl https://ollama.com/install.sh | sh, needs sudo)? [Y/n]: " INSTALL_CHOICE
+  case "${INSTALL_CHOICE:-Y}" in
+    [Yy]*)
+      echo ">> Installing Ollama on ${SERVER_LABEL}..."
+      if ! remote_exec_tty "$REMOTE" 'curl -fsSL https://ollama.com/install.sh | sh'; then
+        echo "!! Ollama install failed on ${SERVER_LABEL}." >&2
+        exit 1
+      fi
+      if ! remote_exec "$REMOTE" 'command -v ollama >/dev/null 2>&1'; then
+        echo "!! Install finished but 'ollama' still isn't on PATH on ${SERVER_LABEL}." >&2
+        echo "!! Open a fresh shell there and check, then re-run this launcher." >&2
+        exit 1
+      fi
+      ;;
+    *) echo "!! Ollama is required — install it on ${SERVER_LABEL} and re-run." >&2; exit 1 ;;
+  esac
+fi
+
 # SERVER_BIND is what Ollama binds on the server; API_HOST is where the client
 # (this machine) reaches it. Same address in local mode; in remote mode the
 # server binds every interface (0.0.0.0) so the LAN can reach it, and the
@@ -870,19 +897,73 @@ esac
 
 # Models live in either the system store or the user store on the TARGET host;
 # Ollama can only use one at a time, so point OLLAMA_MODELS at whichever store
-# has the chosen model there.
-MODEL_STORE="$(remote_script "$REMOTE" <<EOF
+# has the chosen model there. (A function because it re-runs after a pull.)
+detect_model_store() {
+  remote_script "$REMOTE" <<EOF
 for store in /var/lib/ollama/models "\$HOME/.ollama/models"; do
   manifest="\$store/manifests/registry.ollama.ai/library/${MODEL%%:*}/${MODEL##*:}"
   if [[ -f "\$manifest" ]]; then echo "\$store"; break; fi
 done
 EOF
-)"
+}
+MODEL_STORE="$(detect_model_store)"
+
+# Model not there yet — offer to pull it on the target host. `ollama pull` is a
+# client command that needs a server, and WHICH server matters: the pull lands
+# in that server's store. The systemd service the official installer sets up
+# runs as its own `ollama` user with a private store
+# (/usr/share/ollama/.ollama/models, mode 750) that neither detect_model_store
+# nor this launcher's user-run `ollama serve` can read — so never pull through
+# a pre-existing server. Instead start a temporary user-owned server on a side
+# port (11436, no clash with anything on 11434) with OLLAMA_MODELS pinned to
+# the user store, pull through it, and stop it afterwards. OLLAMA_HOST covers
+# both sides at once: the bind address for `serve` and the target for `pull`.
+# Run with a pty so the pull's progress display works.
 if [[ -z "$MODEL_STORE" ]]; then
-  echo "!! Model '$MODEL' not found in /var/lib/ollama/models or ~/.ollama/models on ${SERVER_LABEL}." >&2
-  echo "!! Pull it there first ('ollama pull $MODEL') — or, if a pull is in progress," >&2
-  echo "!! wait for it to finish (manifests only appear when the download completes)." >&2
-  exit 1
+  echo "!! Model '$MODEL' not found in /var/lib/ollama/models or ~/.ollama/models on ${SERVER_LABEL}."
+  read -rp "Pull it now ('ollama pull $MODEL' on ${SERVER_LABEL})? [Y/n]: " PULL_CHOICE
+  case "${PULL_CHOICE:-Y}" in
+    [Yy]*) ;;
+    *) echo "!! Pull it there first ('ollama pull $MODEL'), then re-run." >&2; exit 1 ;;
+  esac
+  PULL_SCRIPT="$(cat <<EOF
+set -e
+export OLLAMA_MODELS="\$HOME/.ollama/models"
+export OLLAMA_HOST="127.0.0.1:11436"
+echo '>> Starting a temporary pull server on ${SERVER_LABEL} (:11436, user store)...'
+nohup ollama serve >/tmp/ollama-hangarbaycc-pull.log 2>&1 </dev/null &
+PULL_SRV=\$!
+trap 'kill "\$PULL_SRV" 2>/dev/null || true' EXIT
+tries=20
+until curl -sf "http://\$OLLAMA_HOST/api/version" >/dev/null 2>&1; do
+  tries=\$((tries - 1))
+  if [ "\$tries" -le 0 ]; then
+    echo '!! Temporary pull server never came up (see /tmp/ollama-hangarbaycc-pull.log).' >&2
+    exit 1
+  fi
+  sleep 0.5
+done
+# Stale partial downloads (sha256-*-partial* chunk files left by an interrupted
+# multi-stream pull) poison Ollama's resume logic: the pull dies with
+# 'Error: EOF' right after 'pulling manifest', every time, until they're
+# removed. If the pull fails, clear them and retry once from scratch.
+if ! ollama pull ${MODEL}; then
+  echo '>> Pull failed — clearing stale partial downloads and retrying once...'
+  rm -f "\$OLLAMA_MODELS"/blobs/*-partial*
+  ollama pull ${MODEL}
+fi
+EOF
+)"
+  if ! remote_exec_tty "$REMOTE" "$PULL_SCRIPT"; then
+    echo "!! Pull of '$MODEL' failed on ${SERVER_LABEL}." >&2
+    exit 1
+  fi
+  MODEL_STORE="$(detect_model_store)"
+  if [[ -z "$MODEL_STORE" ]]; then
+    echo "!! Pull finished but the manifest for '$MODEL' still isn't visible on ${SERVER_LABEL}." >&2
+    echo "!! Check 'ollama list' there." >&2
+    exit 1
+  fi
 fi
 
 echo "Select context window:   (${MODEL} caps at $MAX_CTX)"
@@ -978,9 +1059,28 @@ EOF
 wait_for_http "http://${API_HOST}/api/version" "${REMOTE:+Check the firewall on $REMOTE allows port 11434 from this LAN, and that the server started: ssh $REMOTE tail -20 /tmp/ollama-hangarbaycc.log}"
 
 # --- 3. preload and VERIFY it's fully on the GPU before launching Claude Code --
+# preload "" loads with Ollama's own placement; preload '"num_gpu":99' forces
+# every layer onto the GPU, overriding Ollama's fit estimate.
+preload() {
+  curl -sf "http://${API_HOST}/api/generate" \
+    -d "{\"model\":\"${MODEL}\",\"prompt\":\"hi\",\"stream\":false${1:+,\"options\":{$1}}}" >/dev/null
+}
+# Sets SPILL to a description of any CPU spill ("" = fully on GPU); returns
+# nonzero if /api/ps itself couldn't be read.
+check_spill() {
+  SPILL="$(curl -sf "http://${API_HOST}/api/ps" | python3 -c '
+import json, sys
+for m in json.load(sys.stdin).get("models", []):
+    size, vram = m.get("size", 0), m.get("size_vram", 0)
+    if vram < size:
+        gib = 2 ** 30
+        print("%s: %.1f GiB on CPU of %.1f GiB total"
+              % (m.get("name"), (size - vram) / gib, size / gib))
+')"
+}
+
 echo ">> Preloading (allocates the full KV cache)..."
-if ! curl -sf "http://${API_HOST}/api/generate" \
-  -d "{\"model\":\"${MODEL}\",\"prompt\":\"hi\",\"stream\":false}" >/dev/null; then
+if ! preload ""; then
   echo "!! Preload failed for model '$MODEL' (server returned an error)." >&2
   echo "!! Most likely the model isn't in the store the server is using." >&2
   echo "!!   store in use: ${MODEL_STORE} on ${SERVER_LABEL}" >&2
@@ -989,21 +1089,38 @@ if ! curl -sf "http://${API_HOST}/api/generate" \
 fi
 
 ollama ps
-if ! SPILL="$(curl -sf "http://${API_HOST}/api/ps" | python3 -c '
-import json, sys
-for m in json.load(sys.stdin).get("models", []):
-    size, vram = m.get("size", 0), m.get("size_vram", 0)
-    if vram < size:
-        gib = 2 ** 30
-        print("%s: %.1f GiB on CPU of %.1f GiB total"
-              % (m.get("name"), (size - vram) / gib, size / gib))
-')"; then
+if ! check_spill; then
   echo "!! Could not verify GPU placement (/api/ps check failed)." >&2
   echo "!! Not launching blind — check /tmp/ollama-hangarbaycc.log on ${SERVER_LABEL} and ollama ps." >&2
   exit 1
 fi
+
+# Newer Ollama (0.31+) estimates fit conservatively and parks MoE expert
+# tensors in system RAM when VRAM looks tight (e.g. a desktop session holding
+# a few hundred MiB) even when the model would actually fit. A spill from that
+# estimate — not from being genuinely too big — disappears when the placement
+# is forced, so on spill retry once with num_gpu:99 and re-measure. The forced
+# placement persists for the session: later requests without the option (i.e.
+# everything Claude Code sends) do not trigger a reload. A genuinely too-big
+# config either still spills (caught below) or fails to load (caught here).
 if [[ -n "$SPILL" ]]; then
-  echo "!! $NUM_CTX tokens spilled to CPU — too big for 16 GB VRAM:" >&2
+  echo ">> Spill detected ($SPILL)."
+  echo ">> Retrying with forced full GPU offload (num_gpu 99) — Ollama's fit estimate is often conservative..."
+  ollama stop "$MODEL" 2>/dev/null || true
+  if ! preload '"num_gpu":99'; then
+    echo "!! Forced full-GPU load failed — this context/KV combination genuinely does not fit." >&2
+    echo "!! Re-run and pick a smaller context and/or more compressed KV cache." >&2
+    exit 1
+  fi
+  ollama ps
+  if ! check_spill; then
+    echo "!! Could not verify GPU placement (/api/ps check failed)." >&2
+    echo "!! Not launching blind — check /tmp/ollama-hangarbaycc.log on ${SERVER_LABEL} and ollama ps." >&2
+    exit 1
+  fi
+fi
+if [[ -n "$SPILL" ]]; then
+  echo "!! $NUM_CTX tokens spilled to CPU — too big for 16 GB VRAM even when forced:" >&2
   echo "!!   $SPILL" >&2
   echo "!! Unloading and aborting. Re-run and pick a smaller context / more compressed KV cache." >&2
   ollama stop "$MODEL" 2>/dev/null || true
