@@ -176,7 +176,7 @@ DISALLOWED_TOOLS=(Task Agent Workflow WebFetch WebSearch NotebookEdit)
 # launcher indefinitely). mode="soft" returns 1 on timeout instead of exiting
 # — used for optional features (dictation) that should degrade, not abort.
 wait_for_http() {
-  local url="$1" hint="${2:-}" mode="${3:-hard}" tries=60
+  local url="$1" hint="${2:-}" mode="${3:-hard}" tries="${4:-60}"
   until curl -sf "$url" >/dev/null 2>&1; do
     tries=$((tries - 1))
     if [[ $tries -le 0 ]]; then
@@ -243,6 +243,183 @@ ensure_grok_cli() {
   echo ">> Grok Build CLI installed: $(command -v grok)"
 }
 
+# Shared by ensure_searxng below (its only caller). Same offer-first posture
+# as ensure_grok_cli. Unlike that one, this runs on whichever host will
+# actually serve SearXNG (this machine for the grok-local backend, ml-server
+# for every other backend — see ensure_searxng), so it takes a host argument
+# like remote_exec/remote_script instead of always targeting this shell.
+# Never exits the whole launcher on failure (returns 1 instead) — web search
+# is optional, so a Docker problem should fall back to "no web search", not
+# abort a session that doesn't otherwise need it.
+ensure_docker() {
+  local host="$1" label="${host:-this machine}"
+  if remote_exec "$host" 'docker ps >/dev/null 2>&1'; then
+    return 0
+  fi
+  # Local only: a new terminal window doesn't always start a fresh login
+  # session (desktop terminal emulators commonly just fork off the existing
+  # session), so group membership added by a prior Docker install can still
+  # be invisible here even after "opening a new terminal" — sg re-execs with
+  # the group active without needing an actual logout/login. Remote hosts are
+  # unaffected: an SSH connection always starts a genuine new login session.
+  if [[ -z "$host" ]] && sg docker -c 'docker ps' >/dev/null 2>&1; then
+    echo ">> Using 'sg docker' — this session predates docker group membership."
+    export DOCKER_SG=1
+    return 0
+  fi
+  if ! remote_exec "$host" 'command -v docker >/dev/null 2>&1'; then
+    echo ">> Docker is not installed on ${label}."
+    read -rp "Install it now via the official script (curl https://get.docker.com | sh, needs sudo)? [y/N]: " DOCKER_INSTALL_CONFIRM
+    if [[ ! "$DOCKER_INSTALL_CONFIRM" =~ ^[Yy]$ ]]; then
+      echo "!! Docker declined — continuing without it." >&2
+      return 1
+    fi
+    echo ">> Installing Docker on ${label}..."
+    if ! remote_exec_tty "$host" 'curl -fsSL https://get.docker.com | sudo sh'; then
+      echo "!! Docker install failed on ${label}." >&2
+      return 1
+    fi
+    # The convenience script doesn't do this itself: without it, only root
+    # can run docker, and there's no way to pick that up mid-session (group
+    # membership is read at login, not on demand) — so this alone won't make
+    # docker usable THIS run either, but saves a second install next time.
+    remote_exec_tty "$host" 'sudo usermod -aG docker "$(whoami)"' || true
+  fi
+  if ! remote_exec "$host" 'docker ps >/dev/null 2>&1'; then
+    echo "!! docker is installed on ${label} but this session can't use it yet" >&2
+    echo "!! (group membership needs a fresh login). Log out/in there (or open a" >&2
+    echo "!! new session after 'newgrp docker') and re-run this launcher." >&2
+    return 1
+  fi
+}
+
+# Wires the web-search MCP tool (searxng-mcp/server.py, backed by a SearXNG
+# docker container) into whichever backend is running. On success, sets
+# WEBSEARCH_ENABLED=1 and SEARXNG_MCP_JSON (a ready-to-pass --mcp-config file
+# for Claude Code backends); also (re)writes ./.grok/config.toml's
+# [mcp_servers.searxng] block, which grok's project-scoped config picks up
+# automatically (see the existing model-config comment elsewhere in this
+# file: "project-scoped .grok/config.toml only supports [mcp_servers]") — so
+# the grok backends need no extra CLI flag. Never exits: any failure along
+# the way (declined Docker install, container that won't start, venv setup
+# failure) degrades to WEBSEARCH_ENABLED="" rather than aborting the session,
+# same best-effort posture as the meshllm classifier's setup.
+#
+# Host choice: the grok-local backend is the only one with a "stays fully on
+# this machine, no SSH" contract, so it's the only one that gets a local
+# SearXNG too. Every other backend (Ollama in any mode, meshllm, the ml-server
+# grok backend) already depends on the LAN or ml-server specifically for its
+# own model serving, so they share ONE SearXNG on ml-server rather than each
+# backend running its own — simpler, and consistent with meshllm/grok already
+# treating ml-server as "the server". (Ollama's own --remote target, if it
+# differs from ml-server, doesn't change this — search still goes to
+# ml-server specifically, not wherever Ollama happens to be pointed.)
+ensure_searxng() {
+  WEBSEARCH_ENABLED=""
+  local host port bind api_host label
+  if [[ "$BACKEND" == "grok-local" ]]; then
+    host="" port=8888 bind="127.0.0.1" api_host="127.0.0.1" label="this machine"
+  else
+    host="ml-server" port=8888 bind="0.0.0.0" api_host="192.168.1.16" label="ml-server"
+  fi
+  local base_url="http://${api_host}:${port}/"
+
+  if [[ -n "$host" ]] && ! ssh -o ConnectTimeout=5 "$host" true 2>/dev/null; then
+    echo "!! Could not reach '$host' over SSH — continuing without web search." >&2
+    return 0
+  fi
+
+  if ! ensure_docker "$host"; then
+    echo "!! Continuing without web search." >&2
+    return 0
+  fi
+
+  echo ">> Starting SearXNG on ${label} (:$port) for web search..."
+  if [[ -n "$host" ]]; then
+    remote_exec "$host" 'mkdir -p "$HOME/.hangarbaycc"'
+    if ! scp -q "$SCRIPT_DIR/searxng-server.sh" "$SCRIPT_DIR/searxng-settings.yml" "${host}:.hangarbaycc/"; then
+      echo "!! Could not copy searxng-server.sh to ${label} — continuing without web search." >&2
+      return 0
+    fi
+    if ! remote_exec "$host" "SEARXNG_BIND_ADDR=${bind} SEARXNG_BASE_URL=${base_url} bash ~/.hangarbaycc/searxng-server.sh"; then
+      echo "!! Could not start SearXNG on ${label} — continuing without web search." >&2
+      return 0
+    fi
+  else
+    if ! SEARXNG_BIND_ADDR="$bind" SEARXNG_BASE_URL="$base_url" "$SCRIPT_DIR/searxng-server.sh"; then
+      echo "!! Could not start SearXNG locally — continuing without web search." >&2
+      return 0
+    fi
+  fi
+
+  # 240 tries (120s), not the default 30s: first run on a host pulls the
+  # searxng/searxng image (a few hundred MB) before the container can even
+  # start, which alone can blow past 30s on an ordinary connection.
+  if ! wait_for_http "http://${api_host}:${port}/search?q=test&format=json" \
+      "Check SearXNG's container logs on ${label} (docker logs hangarbaycc-searxng)." soft 240; then
+    echo "!! SearXNG didn't come up in time on ${label} — continuing without web search." >&2
+    return 0
+  fi
+
+  # One-time venv bootstrap for the MCP server. Gitignored, not vendored like
+  # grok-local-server.sh — this is machine-specific installed packages, not a
+  # portable script. Idempotent: skipped once already set up.
+  local venv="$SCRIPT_DIR/searxng-mcp/.venv"
+  if [[ ! -x "$venv/bin/python" ]]; then
+    echo ">> Setting up the searxng-mcp Python venv (one-time)..."
+    if ! python3 -m venv "$venv" \
+        || ! "$venv/bin/pip" install -q --upgrade pip \
+        || ! "$venv/bin/pip" install -q mcp; then
+      echo "!! Could not set up the searxng-mcp venv — continuing without web search." >&2
+      rm -rf "$venv"
+      return 0
+    fi
+  fi
+
+  local mcp_url="http://${api_host}:${port}"
+
+  # Claude Code backends read this via --mcp-config; grok's TOML config
+  # (below) can't take an env var (config.toml's [mcp_servers.*] only
+  # documents command/args, no env table), so server.py accepts the URL as
+  # argv[1] too — this JSON uses env, the TOML block below uses args, same
+  # server script handles either.
+  SEARXNG_MCP_JSON="/tmp/hangarbaycc-searxng-mcp.json"
+  printf '{"mcpServers":{"searxng":{"command":"%s","args":["%s"],"env":{"SEARXNG_URL":"%s"}}}}' \
+    "$venv/bin/python" "$SCRIPT_DIR/searxng-mcp/server.py" "$mcp_url" >"$SEARXNG_MCP_JSON"
+
+  # Project-scoped, not ~/.grok/config.toml (that one's reserved for the
+  # [model.*] entries the grok backends already manage) — grok reads
+  # [mcp_servers] from whichever one is project-scoped, per the comment on
+  # GROK_CONFIG elsewhere in this file. Written at $PWD, not $SCRIPT_DIR:
+  # "project-scoped" means grok resolves it relative to ITS OWN working
+  # directory when exec'd below, which is wherever hangarbaycc.sh was
+  # invoked from — normally the same as $SCRIPT_DIR (the documented usage is
+  # `cd` into the repo then `./hangarbaycc.sh`), but not guaranteed if this
+  # script is invoked by its full path from elsewhere. Machine-specific
+  # (absolute paths, current host's URL), so this file is gitignored,
+  # regenerated every launch.
+  local grok_toml="$PWD/.grok/config.toml"
+  mkdir -p "$(dirname "$grok_toml")"
+  touch "$grok_toml"
+  python3 - "$grok_toml" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path).read()
+text = re.sub(r"\n?\[mcp_servers\.searxng\].*?(?=\n\[|\Z)", "", text, flags=re.S)
+open(path, "w").write(text)
+PY
+  cat >>"$grok_toml" <<EOF
+
+[mcp_servers.searxng]
+command = "$venv/bin/python"
+args = ["$SCRIPT_DIR/searxng-mcp/server.py", "$mcp_url"]
+enabled = true
+EOF
+
+  WEBSEARCH_ENABLED="1"
+  echo ">> Web search ready: SearXNG on ${label}, MCP tool wired in."
+}
+
 # `ollama launch claude` sets CLAUDE_CODE_SUBAGENT_MODEL to EMPTY. Claude's logic
 # is: if the var is set and != "inherit", use it; otherwise fall back to a default
 # 'sonnet' alias — which a local/meshllm backend cannot serve, so every spawned
@@ -269,6 +446,20 @@ ensure_grok_cli() {
 build_launch_settings() {
   printf '{"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"inherit","CLAUDE_CODE_AUTO_COMPACT_WINDOW":"%s"}}' "$NUM_CTX"
 }
+
+# --- web search (optional, all backends) --------------------------------------
+# Asked once here rather than per-backend since ensure_searxng already
+# branches on $BACKEND internally to pick a host. Declining, or any failure
+# inside ensure_searxng, leaves WEBSEARCH_ENABLED empty — every backend below
+# checks it before adding --mcp-config (Claude Code) or relies on grok
+# picking up ./.grok/config.toml automatically; neither path is required to
+# check it beyond that, since ensure_searxng degrades gracefully on its own.
+read -rp "Enable web search via a local SearXNG instance? [y/N]: " WEBSEARCH_CHOICE
+if [[ "$WEBSEARCH_CHOICE" =~ ^[Yy]$ ]]; then
+  ensure_searxng
+else
+  WEBSEARCH_ENABLED=""
+fi
 
 # --- meshllm backend --------------------------------------------------------
 if [[ "$BACKEND" == "meshllm" ]]; then
@@ -588,6 +779,7 @@ EOF
   if [[ -n "$MESHLLM_SKIP_CLASSIFIER" ]]; then
     CLAUDE_EXTRA_ARGS+=(--permission-mode manual)
   fi
+  [[ -n "$WEBSEARCH_ENABLED" ]] && CLAUDE_EXTRA_ARGS+=(--mcp-config "$SEARXNG_MCP_JSON")
 
   # No `ollama launch claude` here — that subcommand tries to pull MODEL from
   # the Ollama registry and fails outright for a non-Ollama model name. claude
@@ -1191,6 +1383,8 @@ trap cleanup EXIT
 # Append the extra editing rules to the system prompt so the local model is
 # reminded how to use the Edit tool (exact byte-for-byte old_string matching)
 # and to compile/test everything it writes.
+OLLAMA_EXTRA_ARGS=()
+[[ -n "$WEBSEARCH_ENABLED" ]] && OLLAMA_EXTRA_ARGS+=(--mcp-config "$SEARXNG_MCP_JSON")
 if [[ -f "$EDIT_RULES" ]]; then
   echo ">> Appending editing rules from $EDIT_RULES"
   echo ">> Stripping tools at the proxy (and auto-denying as backstop): ${DISALLOWED_TOOLS[*]}"
@@ -1199,13 +1393,15 @@ if [[ -f "$EDIT_RULES" ]]; then
   ollama launch claude --model "$MODEL" -y -- \
     --settings "$LAUNCH_SETTINGS" \
     --append-system-prompt "$(cat "$EDIT_RULES")" \
-    --disallowedTools "${DISALLOWED_TOOLS[@]}"
+    --disallowedTools "${DISALLOWED_TOOLS[@]}" \
+    "${OLLAMA_EXTRA_ARGS[@]}"
 else
   echo "!! $EDIT_RULES not found — launching without the editing-rules prompt." >&2
   echo ">> Stripping tools at the proxy (and auto-denying as backstop): ${DISALLOWED_TOOLS[*]}"
   ollama launch claude --model "$MODEL" -y -- \
     --settings "$LAUNCH_SETTINGS" \
-    --disallowedTools "${DISALLOWED_TOOLS[@]}"
+    --disallowedTools "${DISALLOWED_TOOLS[@]}" \
+    "${OLLAMA_EXTRA_ARGS[@]}"
 fi
 
 echo ">> Session over. Temp proxy stopped; ollama server on ${SERVER_LABEL} left running (model stays warm)."

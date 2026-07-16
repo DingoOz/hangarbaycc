@@ -368,6 +368,55 @@ or install manually from <https://x.ai/cli> and re-run. Either way you'll
 still need to be logged in (a SuperGrok/X Premium+ subscription, or an
 `XAI_API_KEY`) — the launcher only handles getting the binary onto `PATH`.
 
+## Web search (SearXNG)
+
+Every backend can optionally give the model real web search, via a
+self-hosted [SearXNG](https://github.com/searxng/searxng) instance and a
+small MCP tool (`searxng-mcp/server.py`) — asked once, right after you pick a
+backend: `Enable web search via a local SearXNG instance? [y/N]`. Declining,
+or any failure along the way, degrades to no web search rather than aborting
+the session; nothing else about the launch changes.
+
+**Where SearXNG runs** depends on the backend, matching each one's existing
+LAN posture:
+- **Backend 5 (Grok Build, local)** — SearXNG runs on *this* machine
+  (`127.0.0.1:8888`), no SSH, no LAN dependency, since that backend's whole
+  point is staying fully local.
+- **Every other backend** (Ollama in any mode, meshllm, backend 4's ml-server
+  grok) — SearXNG runs on `ml-server` (`:8888`, reachable over the LAN),
+  since those backends already depend on the LAN or ml-server specifically
+  for their own model serving. (Ollama's own `--remote` target, if it
+  differs from ml-server, doesn't change this — search still goes to
+  ml-server, matching meshllm/grok's existing convention of treating it as
+  "the server".)
+
+**How it's wired in:** SearXNG's JSON API is disabled by default (public
+instances get scraped otherwise) — `searxng-settings.yml` (vendored in this
+repo, mounted read-only into the container) turns it on for this private,
+non-internet-facing instance. `searxng-mcp/server.py` is a small MCP stdio
+server (hand-written against the official `mcp` Python SDK, not one of the
+existing npm `searxng-mcp` packages, since neither Node nor npm is assumed to
+be installed) exposing one `web_search` tool that hits SearXNG's
+`/search?format=json`. It runs in its own venv (`searxng-mcp/.venv`,
+git-ignored, bootstrapped on first use) so nothing installs into system
+Python. Claude Code backends get it via `--mcp-config` (a generated
+`/tmp/hangarbaycc-searxng-mcp.json`); the grok backends get it via a
+generated `[mcp_servers.searxng]` block in `./.grok/config.toml`
+(project-scoped — grok reads `[mcp_servers]` only from there, not from the
+global `~/.grok/config.toml` used for the `[model.*]` entries above), which
+grok picks up automatically with no extra flag. Both configs are
+machine-specific (absolute paths, the resolved host's URL) and regenerated
+every launch, so neither is meant to be committed.
+
+**Requires Docker** on whichever host is serving SearXNG for that backend
+(see above). If it's missing, you're offered the official installer
+(`curl -fsSL https://get.docker.com | sh`, needs sudo) — same offer-first
+posture as the Ollama and grok CLI installers elsewhere in this launcher.
+One wrinkle specific to Docker: a fresh install adds your user to the
+`docker` group, but group membership is only read at login, so a session
+that just installed Docker still can't use it — you'll need to log out/in
+(or open a new SSH session, for the remote/ml-server case) and re-run.
+
 ## Dependencies
 
 Everything the launcher shells out to. On a single-machine setup all of these
@@ -391,6 +440,10 @@ the GPU host (server) as noted.
   `arecord` to capture the mic; `wtype` and/or `ydotool` (+ `ydotoold`
   running) to type the transcript; optionally `wl-copy` (wl-clipboard) and
   `notify-send` for the clipboard fallback and status notifications.
+- **For web search only:** `python3 -m venv` (stdlib `venv` module) to
+  bootstrap `searxng-mcp/.venv` on first use; `scp` (bundled with the `ssh`
+  client on virtually every distro) when SearXNG runs on `ml-server` rather
+  than locally.
 
 **On the machine that hosts the model (server — the same box locally, or the
 `--remote` host):**
@@ -405,6 +458,11 @@ the GPU host (server) as noted.
   (`nvcc` — Ollama bundles its own CUDA runtime and doesn't need this, so
   it's the one new build-time dependency); ~1–2 GB free disk under
   `~/whisper.cpp` for the build and model.
+
+**On whichever host serves SearXNG (this machine for backend 5; `ml-server`
+for every other backend) — only if web search is enabled:**
+- **Docker** — offered via the official installer if missing (see "Web
+  search" above). ~256 MB RAM for the container; no GPU needed.
 
 **For the benchmark (`bench/`) only:**
 - **`gcc` / `g++`** — the bench compiles and runs the C/C++ tasks to score them.
