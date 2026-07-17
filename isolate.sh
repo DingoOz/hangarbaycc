@@ -5,16 +5,17 @@
 # Usage:
 #   isolate.sh [blocklist ...] -- command [args...]
 #
-# Applies nftables cgroup-based OUTPUT rules that block the specified
-# domains/IPs while allowing all other traffic. By default, blocks xAI
-# traffic (api.x.ai) to prevent data exfiltration.
+# Creates a network namespace with only loopback, then uses socat to
+# forward the specific ports the command needs (model server, SearXNG).
+# All other outbound traffic is impossible — the namespace has no
+# external network interface.
 #
 # Blocklist entries can be:
 #   api.x.ai            — specific domain/IP to block
 #   xai                 — shorthand for all xAI domains
 #   any / loopback      — block all external traffic (allow only loopback)
 #
-# Requires: root (for nftables + cgroup creation)
+# Requires: root (for network namespace creation + socat)
 #
 # Exit codes:
 #   0  — command exited successfully
@@ -22,8 +23,6 @@
 #   N  — command exit code (passed through)
 
 set -euo pipefail
-
-# --- Helpers ------------------------------------------------------------------
 
 log()  { echo ">> isolate.sh: $*"; }
 warn() { echo ">> isolate.sh: WARNING: $*" >&2; }
@@ -46,7 +45,6 @@ for arg in "$@"; do
   fi
 done
 
-# Default: block xAI traffic
 if [[ ${#BLOCKLIST[@]} -eq 0 ]]; then
   BLOCKLIST=("api.x.ai")
 fi
@@ -56,200 +54,111 @@ if [[ ${#COMMAND[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# --- Prepare nftables ---------------------------------------------------------
+# --- Check prerequisites ------------------------------------------------------
 
-NFT_TABLE="hangarbaycc-isolate"
-CGROUP_NAME="hangarbaycc-isolate-$$"
+check_prereqs() {
+  for cmd in socat ip; do
+    if ! command -v "$cmd" &>/dev/null; then
+      warn "'$cmd' not found — cannot set up network namespace isolation"
+      return 1
+    fi
+  done
+
+  # Verify we can create a network namespace
+  if ! sudo ip netns add "__hangarbaycc-test-$$" 2>/dev/null; then
+    warn "Cannot create network namespace — need root privileges"
+    return 1
+  fi
+  sudo ip netns delete "__hangarbaycc-test-$$" 2>/dev/null || true
+  return 0
+}
+
+# --- Main ---------------------------------------------------------------------
+
+NETNS="hangarbaycc-$$"
+NS_LO_UP=0
+NS_SOCATS=()
 CLEANED_UP=0
 
 cleanup() {
   if [[ $CLEANED_UP -eq 1 ]]; then return; fi
   CLEANED_UP=1
   log "Tearing down isolation..."
-  sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
-  sudo rm -rf "/sys/fs/cgroup/$CGROUP_NAME" 2>/dev/null || true
+
+  # Kill socat forwarders
+  for pid in "${NS_SOCATS[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+
+  # Bring down loopback in namespace
+  if [[ $NS_LO_UP -eq 1 ]]; then
+    sudo ip netns exec "$NETNS" ip link set lo down 2>/dev/null || true
+  fi
+
+  # Delete namespace
+  sudo ip netns delete "$NETNS" 2>/dev/null || true
+
   log "Isolation removed."
 }
 trap cleanup EXIT
 
-# --- Resolve domains to IPs ---------------------------------------------------
+log "Setting up network namespace isolation..."
 
-resolve_domain() {
-  local domain="$1"
-  local ip
-  ip=$(getent ahostsv4 "$domain" 2>/dev/null | head -1 | awk '{print $1}')
-  if [[ -z "$ip" ]]; then
-    warn "Could not resolve domain: $domain"
-    return 1
-  fi
-  echo "$ip"
-}
+if ! check_prereqs; then
+  warn "Running command without network isolation"
+  exec "${COMMAND[@]}"
+fi
 
-# --- Set up nftables rules ----------------------------------------------------
+# Create network namespace
+sudo ip netns add "$NETNS"
+log "Created network namespace '$NETNS'"
 
-setup_nftables() {
-  # Clean up any stale table from a previous failed run (prevents duplicate rules)
-  sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+# Bring up loopback inside the namespace
+sudo ip netns exec "$NETNS" ip link set lo up
+NS_LO_UP=1
+log "Loopback up in namespace"
 
-  # Create table and chain with policy ACCEPT (allow everything by default)
-  sudo nft add table inet "$NFT_TABLE"
-  sudo nft add chain inet "$NFT_TABLE" output \
-    '{ type filter hook output priority filter; policy accept; }'
+# Determine which local ports the isolated process needs to reach.
+# The command connects to 127.0.0.1 in its own namespace, which only has lo.
+# We need socat to forward those ports to the HOST's 127.0.0.1.
+#
+# Default ports needed for hangarbaycc:
+#   8080 = grok-local model server (localhost on host)
+#   8888 = SearXNG (localhost on host)
+NEEDED_PORTS=(8080 8888)
 
-  # Verify the table was actually created
-  if ! sudo nft list table inet "$NFT_TABLE" >/dev/null 2>&1; then
-    warn "nftables table '$NFT_TABLE' was not created — setup failed"
-    return 1
-  fi
-
-  log "nftables table '$NFT_TABLE' created (policy: accept)"
-
-  # Create a set for blocked destinations
-  sudo nft add set inet "$NFT_TABLE" blocked_ips '{ type ipv4_addr; flags interval; }'
-  sudo nft add set inet "$NFT_TABLE" blocked_ports '{ type inet_service; flags interval; }'
-
-  # Add blocklist entries to the set
-  FULL_BLOCK=0
-  for entry in "${BLOCKLIST[@]}"; do
-    case "$entry" in
-      xai)
-        # Block all xAI domains
-        local xai_ips
-        xai_ips=$(resolve_domain "api.x.ai" 2>/dev/null || true)
-        if [[ -n "$xai_ips" ]]; then
-          sudo nft add element inet "$NFT_TABLE" blocked_ips "{ $xai_ips }"
-          log "Blocked xAI API (api.x.ai -> $xai_ips)"
-        fi
-        # Also block x.ai domain
-        local x_ai_ips
-        x_ai_ips=$(resolve_domain "x.ai" 2>/dev/null || true)
-        if [[ -n "$x_ai_ips" ]]; then
-          sudo nft add element inet "$NFT_TABLE" blocked_ips "{ $x_ai_ips }"
-          log "Blocked x.ai domain ($x_ai_ips)"
-        fi
-        ;;
-      any|loopback)
-        FULL_BLOCK=1
-        log "Will block all external traffic (allow only loopback) for cgroup"
-        ;;
-      *)
-        # Block specific domain/IP
-        local ip
-        ip=$(resolve_domain "$entry" 2>/dev/null || echo "$entry")
-        sudo nft add element inet "$NFT_TABLE" blocked_ips "{ $ip }"
-        log "Blocked $entry -> $ip"
-        ;;
-    esac
+# Also check what's actually listening on 127.0.0.1
+while read -r local_addr; do
+  port="${local_addr##*:}"
+  # Add if not already in the list
+  local found=0
+  for p in "${NEEDED_PORTS[@]}"; do
+    [[ "$p" == "$port" ]] && found=1 && break
   done
-
-  # Rules are applied later (after cgroup is created) via apply_cgroup_rules()
-  # so they only affect the isolated process, not the whole system.
-  log "Blocklist set populated. Cgroup-aware rules will be applied after cgroup is created."
-}
-
-# --- Apply cgroup-aware nftables rules ----------------------------------------
-
-# This MUST be called after create_cgroup() so we can reference the cgroup name.
-# Rules use 'socket cgroupv2' matching so they only affect the isolated process.
-apply_cgroup_rules() {
-  if [[ "$FULL_BLOCK" -eq 1 ]]; then
-    # Block everything except loopback for this cgroup only
-    sudo nft add rule inet "$NFT_TABLE" output \
-      socket cgroupv2 level 1 "$CGROUP_NAME" ip daddr != 127.0.0.0/8 drop
-    log "Added cgroup rule: drop non-loopback for $CGROUP_NAME"
-  else
-    # Block only the IPs in blocked_ips for this cgroup
-    sudo nft add rule inet "$NFT_TABLE" output \
-      socket cgroupv2 level 1 "$CGROUP_NAME" ip daddr @blocked_ips drop
-    log "Added cgroup rule: drop blocked_ips for $CGROUP_NAME"
+  if [[ $found -eq 0 ]]; then
+    NEEDED_PORTS+=("$port")
   fi
-}
+done < <(ss -tlnH sport = 127.0.0.1:* 2>/dev/null | awk '{print $4}' | grep -v 'Local' || true)
 
-# --- Create cgroup and move process into it -----------------------------------
+# Start socat forwarders: namespace-127.0.0.1:<port> -> host-127.0.0.1:<port>
+# We use the SAME port in the namespace as on the host. The namespace has its own
+# network stack, so port 8080 in the namespace does NOT conflict with port 8080
+# on the host — they are completely separate sockets.
+for port in "${NEEDED_PORTS[@]}"; do
+  sudo ip netns exec "$NETNS" socat \
+    TCP-LISTEN:127.0.0.1:${port},fork,reuseaddr \
+    TCP:127.0.0.1:${port} &
+  NS_SOCATS+=($!)
+  log "Forwarding ns:127.0.0.1:${port} -> host:127.0.0.1:${port} (socat pid ${NS_SOCATS[-1]})"
+done
 
-create_cgroup() {
-  # Create the cgroup directory
-  sudo mkdir "/sys/fs/cgroup/$CGROUP_NAME"
+log "Isolation active. Namespace '$NETNS' has only loopback."
+log "All connections to 127.0.0.1 in the namespace are forwarded to the host."
 
-  # Move the calling shell's process into it
-  echo $$ | sudo tee "/sys/fs/cgroup/$CGROUP_NAME/cgroup.procs" >/dev/null
+# --- Execute command in namespace ---------------------------------------------
 
-  # Verify the move worked
-  if [[ "$(cat /proc/self/cgroup | grep "$CGROUP_NAME")" != "" ]]; then
-    log "Created cgroup '$CGROUP_NAME' and moved shell into it"
-    return 0
-  fi
-
-  warn "Shell may not have moved into cgroup — isolation may not work"
-  return 1
-}
-
-# --- Verify nftables socket cgroupv2 support ----------------------------------
-
-test_cgroup_support() {
-  local test_cgroup="hangarbaycc-cgroup-test-$$"
-
-  # Create a test cgroup
-  sudo mkdir "/sys/fs/cgroup/$test_cgroup" 2>/dev/null || return 0
-
-  # Try matching against it
-  sudo nft add table inet test-cgroup 2>/dev/null || {
-    sudo rm -rf "/sys/fs/cgroup/$test_cgroup" 2>/dev/null || true
-    return 0
-  }
-  sudo nft add chain inet test-cgroup output \
-    '{ type filter hook output priority filter; policy accept; }' 2>/dev/null || {
-    sudo nft delete table inet test-cgroup 2>/dev/null || true
-    sudo rm -rf "/sys/fs/cgroup/$test_cgroup" 2>/dev/null || true
-    return 0
-  }
-
-  # Level 1 = top-level cgroup name (the name we used in mkdir)
-  sudo nft add rule inet test-cgroup output socket cgroupv2 level 1 "$test_cgroup" drop 2>/dev/null && {
-    # Success — cgroupv2 matching works
-    sudo nft delete table inet test-cgroup 2>/dev/null || true
-    sudo rm -rf "/sys/fs/cgroup/$test_cgroup" 2>/dev/null || true
-    return 0
-  }
-
-  # Failed
-  sudo nft delete table inet test-cgroup 2>/dev/null || true
-  sudo rm -rf "/sys/fs/cgroup/$test_cgroup" 2>/dev/null || true
-  warn "socket cgroupv2 matching not supported on this kernel"
-  return 1
-}
-
-# --- Main ---------------------------------------------------------------------
-
-log "Setting up network isolation..."
-
-if ! setup_nftables; then
-  warn "nftables setup failed — running command without network isolation"
-  exec "${COMMAND[@]}"
-fi
-
-if ! test_cgroup_support; then
-  warn "Cgroup v2 matching test failed — falling back to no isolation"
-  cleanup
-  exec "${COMMAND[@]}"
-fi
-
-if ! create_cgroup; then
-  warn "Failed to create cgroup — falling back to no isolation"
-  cleanup
-  exec "${COMMAND[@]}"
-fi
-
-# Apply nftables rules AFTER cgroup is created, so they reference the correct cgroup.
-# Rules use 'socket cgroupv2' matching — they only affect processes in this cgroup,
-# not the entire system.
-apply_cgroup_rules
-
-log "Isolation active. Blocked: ${BLOCKLIST[*]}"
-log "Cgroup: $CGROUP_NAME"
-
-# --- Execute command ----------------------------------------------------------
-
-# We're already in the cgroup (the shell moved itself in).
-# exec replaces this shell with the command, which inherits the cgroup.
-exec "${COMMAND[@]}"
+# The command runs inside the namespace. It only sees loopback.
+# All 127.0.0.1:<port> connections are forwarded to the host's 127.0.0.1:<port>.
+# The command uses the same ports as normal — no configuration needed.
+log "Launching command in isolated namespace..."
+exec sudo ip netns exec "$NETNS" "${COMMAND[@]}"
