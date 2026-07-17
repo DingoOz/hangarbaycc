@@ -127,7 +127,7 @@ USAGE
 
 REMOTE=""
 DICTATE=""
-ISOLATE=""
+ISOLATE="1"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -r|--remote) REMOTE="${2:?--remote requires a HOST argument}"; shift 2 ;;
@@ -453,18 +453,9 @@ build_launch_settings() {
 }
 
 # --- web search (optional, all backends) --------------------------------------
-# Asked once here rather than per-backend since ensure_searxng already
-# branches on $BACKEND internally to pick a host. Declining, or any failure
-# inside ensure_searxng, leaves WEBSEARCH_ENABLED empty — every backend below
-# checks it before adding --mcp-config (Claude Code) or relies on grok
-# picking up ./.grok/config.toml automatically; neither path is required to
-# check it beyond that, since ensure_searxng degrades gracefully on its own.
-read -rp "Enable web search via a local SearXNG instance? [y/N]: " WEBSEARCH_CHOICE
-if [[ "$WEBSEARCH_CHOICE" =~ ^[Yy]$ ]]; then
-  ensure_searxng
-else
-  WEBSEARCH_ENABLED=""
-fi
+# Always enabled. ensure_searxng degrades gracefully — if Docker/SearXNG
+# isn't available it leaves WEBSEARCH_ENABLED empty rather than aborting.
+ensure_searxng
 
 # --- meshllm backend --------------------------------------------------------
 if [[ "$BACKEND" == "meshllm" ]]; then
