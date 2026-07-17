@@ -984,7 +984,7 @@ EOF
     # Network isolation: allow loopback (model server + SearXNG on 127.0.0.1),
     # block everything else. Uses nftables cgroup matching.
     echo ">> Network isolation enabled: loopback only, all other traffic blocked."
-    exec "$SCRIPT_DIR/isolate.sh" any -- grok -m "$GROK_MODEL_ID" --disable-web-search
+    exec "$SCRIPT_DIR/isolate.sh" any -- grok -m "$GROK_MODEL_ID"
   else
     exec grok -m "$GROK_MODEL_ID" --disable-web-search
   fi
