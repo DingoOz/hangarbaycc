@@ -108,7 +108,7 @@ setup_nftables() {
   sudo nft add set inet "$NFT_TABLE" blocked_ips '{ type ipv4_addr; flags interval; }'
   sudo nft add set inet "$NFT_TABLE" blocked_ports '{ type inet_service; flags interval; }'
 
-  # Add blocklist entries
+  # Add blocklist entries to the set
   FULL_BLOCK=0
   for entry in "${BLOCKLIST[@]}"; do
     case "$entry" in
@@ -129,10 +129,8 @@ setup_nftables() {
         fi
         ;;
       any|loopback)
-        # Block everything except loopback (127.0.0.0/8)
-        sudo nft add rule inet "$NFT_TABLE" output ip daddr != 127.0.0.0/8 drop
         FULL_BLOCK=1
-        log "Blocking all external traffic (allow only loopback)"
+        log "Will block all external traffic (allow only loopback) for cgroup"
         ;;
       *)
         # Block specific domain/IP
@@ -144,16 +142,27 @@ setup_nftables() {
     esac
   done
 
-  # Add the final drop rule for blocked destinations (skip for full-block mode
-  # since the catch-all rule above already blocks everything non-loopback)
-  if [[ "$FULL_BLOCK" -eq 0 ]]; then
-    sudo nft add rule inet "$NFT_TABLE" output ip daddr @blocked_ips drop
-  fi
+  # Rules are applied later (after cgroup is created) via apply_cgroup_rules()
+  # so they only affect the isolated process, not the whole system.
+  log "Blocklist set populated. Cgroup-aware rules will be applied after cgroup is created."
+}
 
-  # Verify rules were applied
-  local rule_count
-  rule_count=$(sudo nft list chain inet "$NFT_TABLE" output 2>/dev/null | grep -c "accept\|drop\|set" || true)
-  log "Applied $rule_count rules to '$NFT_TABLE'"
+# --- Apply cgroup-aware nftables rules ----------------------------------------
+
+# This MUST be called after create_cgroup() so we can reference the cgroup name.
+# Rules use 'socket cgroupv2' matching so they only affect the isolated process.
+apply_cgroup_rules() {
+  if [[ "$FULL_BLOCK" -eq 1 ]]; then
+    # Block everything except loopback for this cgroup only
+    sudo nft add rule inet "$NFT_TABLE" output \
+      socket cgroupv2 level 1 "$CGROUP_NAME" ip daddr != 127.0.0.0/8 drop
+    log "Added cgroup rule: drop non-loopback for $CGROUP_NAME"
+  else
+    # Block only the IPs in blocked_ips for this cgroup
+    sudo nft add rule inet "$NFT_TABLE" output \
+      socket cgroupv2 level 1 "$CGROUP_NAME" ip daddr @blocked_ips drop
+    log "Added cgroup rule: drop blocked_ips for $CGROUP_NAME"
+  fi
 }
 
 # --- Create cgroup and move process into it -----------------------------------
@@ -230,6 +239,11 @@ if ! create_cgroup; then
   cleanup
   exec "${COMMAND[@]}"
 fi
+
+# Apply nftables rules AFTER cgroup is created, so they reference the correct cgroup.
+# Rules use 'socket cgroupv2' matching — they only affect processes in this cgroup,
+# not the entire system.
+apply_cgroup_rules
 
 log "Isolation active. Blocked: ${BLOCKLIST[*]}"
 log "Cgroup: $CGROUP_NAME"
