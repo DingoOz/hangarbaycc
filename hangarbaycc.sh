@@ -103,13 +103,16 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: hangarbaycc.sh [-r|--remote HOST] [-d|--dictate]
+Usage: hangarbaycc.sh [-r|--remote HOST] [-d|--dictate] [-i|--isolate]
 
   -r, --remote HOST   Run the Ollama server on HOST over SSH instead of this
                        machine. The proxy and Claude Code still run here.
                        Ollama backend only.
   -d, --dictate        Start voice dictation (whisper-server on the GPU host).
                        Ollama remote mode only; see README.md "Voice dictation".
+  -i, --isolate        Network-isolate the grok process (local backend only).
+                       Blocks all outbound traffic except loopback (127.0.0.0/8).
+                       Uses nftables socket cgroupv2 matching. Requires root.
   -h, --help           Show this help.
 
 HOST may also come from the HANGARBAY_REMOTE environment variable; the flag
@@ -124,11 +127,13 @@ USAGE
 
 REMOTE=""
 DICTATE=""
+ISOLATE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -r|--remote) REMOTE="${2:?--remote requires a HOST argument}"; shift 2 ;;
     --remote=*)  REMOTE="${1#*=}"; shift ;;
     -d|--dictate) DICTATE="1"; shift ;;
+    -i|--isolate) ISOLATE="1"; shift ;;
     -h|--help)   usage; exit 0 ;;
     *) echo "!! Unknown argument: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -177,7 +182,7 @@ DISALLOWED_TOOLS=(Task Agent Workflow WebFetch WebSearch NotebookEdit)
 # — used for optional features (dictation) that should degrade, not abort.
 wait_for_http() {
   local url="$1" hint="${2:-}" mode="${3:-hard}" tries="${4:-60}"
-  until curl -sf "$url" >/dev/null 2>&1; do
+  until curl -sf -m 5 "$url" >/dev/null 2>&1; do
     tries=$((tries - 1))
     if [[ $tries -le 0 ]]; then
       echo "!! Timed out waiting for ${url} to answer." >&2
@@ -975,7 +980,16 @@ EOF
   fi
 
   echo ">> Launching Grok Build locally (model server left running afterward — stays warm)..."
-  exec grok -m "$GROK_MODEL_ID" --disable-web-search
+  if [[ -n "$ISOLATE" ]]; then
+    # Network isolation: block xAI's own domains only (DNS blackhole in a
+    # private mount namespace) so the harness can never phone home to xAI's
+    # cloud. Normal internet access, and loopback services (model server,
+    # SearXNG), are unaffected.
+    echo ">> Network isolation enabled: xAI domains blocked, all other traffic unaffected."
+    exec "$SCRIPT_DIR/isolate.sh" xai -- grok -m "$GROK_MODEL_ID"
+  else
+    exec grok -m "$GROK_MODEL_ID" --disable-web-search
+  fi
 fi
 
 # --- Ollama backend ----------------------------------------------------------

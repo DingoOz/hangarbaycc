@@ -11,6 +11,9 @@
 # SEARXNG_BIND_ADDR=0.0.0.0 so the LAN can reach it — same posture as
 # whisper-server/mesh-llm's remote binds elsewhere in this repo.
 #
+# Uses --network host to avoid Docker iptables NAT issues. The container
+# binds directly to the host's network stack.
+#
 # Idempotent and fast: `docker run -d` is already backgrounded by the Docker
 # daemon, so unlike grok-local-server.sh (execs a foreground process the
 # caller backgrounds with setsid/nohup), this script just ensures the
@@ -34,21 +37,50 @@ IMAGE="${SEARXNG_IMAGE:-docker.io/searxng/searxng:latest}"
 SETTINGS_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/searxng-settings.yml"
 
 if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-  echo ">> $CONTAINER_NAME already running."
+  # Container is running — verify SearXNG is actually responding
+  if curl -sf -m 3 "${BASE_URL}search?q=test&format=json" >/dev/null 2>&1; then
+    echo ">> $CONTAINER_NAME already running and healthy."
+    exit 0
+  fi
+  echo ">> $CONTAINER_NAME running but not responding — restarting..."
+  docker restart "$CONTAINER_NAME" >/dev/null
+  echo ">> Waiting for $CONTAINER_NAME to become healthy..."
+  tries=120
+  until curl -sf -m 3 "${BASE_URL}search?q=test&format=json" >/dev/null 2>&1; do
+    tries=$((tries - 1))
+    if [[ $tries -le 0 ]]; then
+      echo "!! $CONTAINER_NAME did not become healthy after restart." >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+  echo ">> $CONTAINER_NAME is healthy after restart."
   exit 0
 fi
 
 if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   echo ">> Starting existing (stopped) $CONTAINER_NAME container..."
   docker start "$CONTAINER_NAME" >/dev/null
+  echo ">> Waiting for $CONTAINER_NAME to become healthy..."
+  tries=120
+  until curl -sf -m 3 "${BASE_URL}search?q=test&format=json" >/dev/null 2>&1; do
+    tries=$((tries - 1))
+    if [[ $tries -le 0 ]]; then
+      echo "!! $CONTAINER_NAME did not become healthy after start." >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+  echo ">> $CONTAINER_NAME is healthy after start."
   exit 0
 fi
 
-echo ">> Creating $CONTAINER_NAME container (${BIND_ADDR}:${PORT}, JSON API enabled)..."
+echo ">> Creating $CONTAINER_NAME container (:${PORT}, JSON API enabled)..."
 docker run -d \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
-  -p "${BIND_ADDR}:${PORT}:8080" \
+  --network host \
+  -e SEARXNG_PORT=${PORT} \
   -v "${SETTINGS_FILE}:/etc/searxng/settings.yml:ro" \
   -e "SEARXNG_BASE_URL=${BASE_URL}" \
   "$IMAGE" >/dev/null

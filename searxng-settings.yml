@@ -16,9 +16,19 @@ server:
   limiter: false
   image_proxy: false
 
+general:
+  debug: false
+
 search:
   safe_search: 0
   autocomplete: ""
   formats:
     - html
     - json
+  query_in_body: true
+  default_lang: ""
+
+# Disable engines that crash during init or are unreliable
+engines:
+  - name: wikidata
+    inactive: true
