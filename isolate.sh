@@ -146,7 +146,7 @@ done < <(ss -tlnH sport = 127.0.0.1:* 2>/dev/null | awk '{print $4}' | grep -v '
 # on the host — they are completely separate sockets.
 for port in "${NEEDED_PORTS[@]}"; do
   sudo ip netns exec "$NETNS" socat \
-    TCP-LISTEN:127.0.0.1:${port},fork,reuseaddr \
+    TCP-LISTEN:${port},fork,reuseaddr,bind=127.0.0.1 \
     TCP:127.0.0.1:${port} &
   NS_SOCATS+=($!)
   log "Forwarding ns:127.0.0.1:${port} -> host:127.0.0.1:${port} (socat pid ${NS_SOCATS[-1]})"
