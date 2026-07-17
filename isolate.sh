@@ -161,4 +161,4 @@ log "All connections to 127.0.0.1 in the namespace are forwarded to the host."
 # All 127.0.0.1:<port> connections are forwarded to the host's 127.0.0.1:<port>.
 # The command uses the same ports as normal — no configuration needed.
 log "Launching command in isolated namespace..."
-exec sudo ip netns exec "$NETNS" "${COMMAND[@]}"
+exec sudo ip netns exec "$NETNS" env PATH="$PATH" HOME="$HOME" LANG="$LANG" "${COMMAND[@]}"
