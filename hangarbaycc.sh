@@ -103,13 +103,16 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-Usage: hangarbaycc.sh [-r|--remote HOST] [-d|--dictate]
+Usage: hangarbaycc.sh [-r|--remote HOST] [-d|--dictate] [-i|--isolate]
 
   -r, --remote HOST   Run the Ollama server on HOST over SSH instead of this
                        machine. The proxy and Claude Code still run here.
                        Ollama backend only.
   -d, --dictate        Start voice dictation (whisper-server on the GPU host).
                        Ollama remote mode only; see README.md "Voice dictation".
+  -i, --isolate        Network-isolate the grok process (backend 5 only).
+                       Blocks all outbound traffic except loopback (127.0.0.0/8).
+                       Uses systemd scope + nftables cgroup matching. Requires root.
   -h, --help           Show this help.
 
 HOST may also come from the HANGARBAY_REMOTE environment variable; the flag
@@ -124,11 +127,13 @@ USAGE
 
 REMOTE=""
 DICTATE=""
+ISOLATE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -r|--remote) REMOTE="${2:?--remote requires a HOST argument}"; shift 2 ;;
     --remote=*)  REMOTE="${1#*=}"; shift ;;
     -d|--dictate) DICTATE="1"; shift ;;
+    -i|--isolate) ISOLATE="1"; shift ;;
     -h|--help)   usage; exit 0 ;;
     *) echo "!! Unknown argument: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -975,7 +980,14 @@ EOF
   fi
 
   echo ">> Launching Grok Build locally (model server left running afterward — stays warm)..."
-  exec grok -m "$GROK_MODEL_ID" --disable-web-search
+  if [[ -n "$ISOLATE" ]]; then
+    # Network isolation: allow loopback (model server + SearXNG on 127.0.0.1),
+    # block everything else. Uses systemd scope + nftables cgroup matching.
+    echo ">> Network isolation enabled: loopback only, all other traffic blocked."
+    exec "$SCRIPT_DIR/isolate.sh" loopback -- grok -m "$GROK_MODEL_ID" --disable-web-search
+  else
+    exec grok -m "$GROK_MODEL_ID" --disable-web-search
+  fi
 fi
 
 # --- Ollama backend ----------------------------------------------------------

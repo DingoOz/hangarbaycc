@@ -417,6 +417,39 @@ One wrinkle specific to Docker: a fresh install adds your user to the
 that just installed Docker still can't use it — you'll need to log out/in
 (or open a new SSH session, for the remote/ml-server case) and re-run.
 
+## Network isolation (--isolate)
+
+Backend 5 (Grok Build, local) now supports network isolation via
+`--isolate`. This wraps the `grok` process in a systemd user scope and
+applies nftables OUTPUT rules that block all outbound traffic except
+loopback (127.0.0.0/8) — keeping the local model server and SearXNG
+reachable while preventing any other network access.
+
+**How it works:**
+1. Creates a transient systemd scope (`hangarbaycc-isolate-$$`)
+2. Adds nftables OUTPUT chain with `policy drop`
+3. Allows loopback traffic (`oif lo accept`)
+4. Matches the scope's cgroup via `socket cgroupv2` rules
+5. On exit, tears down nftables rules and scope automatically
+
+**Requirements:**
+- **nftables** v1.0+ with `CONFIG_NFT_SOCKET` kernel module
+- **systemd** user manager running (usually automatic)
+- **root** (for nftables table/chain creation)
+- **Kernel ≥ 5.19** with cgroup v2 support (most modern distros)
+
+**Limitations:**
+- Only works for backend 5 (grok-local) — other backends already run on
+  remote hosts where isolation is managed differently
+- Falls back to no isolation if any setup step fails (no hard error)
+- The model server (`grok-local-server.sh`) is NOT isolated — it runs
+  as a detached child process outside the scope
+
+**Usage:**
+```bash
+./hangarbaycc.sh -i  # or: ./hangarbaycc.sh --isolate
+```
+
 ## Dependencies
 
 Everything the launcher shells out to. On a single-machine setup all of these
