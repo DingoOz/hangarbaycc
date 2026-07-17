@@ -12,7 +12,7 @@
 # Blocklist entries can be:
 #   api.x.ai            — specific domain/IP to block
 #   xai                 — shorthand for all xAI domains
-#   any                 — block all external traffic (default when no entries given)
+#   any / loopback      — block all external traffic (allow only loopback)
 #
 # Requires: root (for nftables + cgroup creation)
 #
@@ -124,7 +124,7 @@ setup_nftables() {
           log "Blocked x.ai domain ($x_ai_ips)"
         fi
         ;;
-      any)
+      any|loopback)
         # Block everything except loopback
         sudo nft add rule inet "$NFT_TABLE" output oif lo accept
         sudo nft add rule inet "$NFT_TABLE" output ip daddr 127.0.0.0/8 accept
