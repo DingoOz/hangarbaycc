@@ -16,19 +16,19 @@ server:
   limiter: false
   image_proxy: false
 
+general:
+  debug: false
+
 search:
   safe_search: 0
   autocomplete: ""
   formats:
     - html
     - json
-
-# Disable SearXNG's internal rate limiter (prevents "Too many requests" errors
-# when the MCP tool makes repeated searches in quick succession)
-general:
-  debug: false
-
-search:
   query_in_body: true
   default_lang: ""
-  ban_time_onTooManyRequests: 0
+
+# Disable engines that crash during init or are unreliable
+engines:
+  - name: wikidata
+    inactive: true

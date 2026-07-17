@@ -34,7 +34,13 @@ IMAGE="${SEARXNG_IMAGE:-docker.io/searxng/searxng:latest}"
 SETTINGS_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/searxng-settings.yml"
 
 if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-  echo ">> $CONTAINER_NAME already running."
+  # Container is running — verify SearXNG is actually responding
+  if curl -sf -m 3 "${BASE_URL}search?q=test&format=json" >/dev/null 2>&1; then
+    echo ">> $CONTAINER_NAME already running and healthy."
+    exit 0
+  fi
+  echo ">> $CONTAINER_NAME running but not responding — restarting..."
+  docker restart "$CONTAINER_NAME" >/dev/null
   exit 0
 fi
 
