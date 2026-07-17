@@ -1,0 +1,24 @@
+# searxng-settings.yml — mounted into the SearXNG container by
+# searxng-server.sh (and, on the remote/ml-server path, by hangarbaycc.sh's
+# ensure_searxng()) so the JSON API used by the web-search MCP tool works.
+#
+# `use_default_settings: true` merges these overrides onto SearXNG's baked-in
+# defaults rather than replacing the whole config, so this file only needs to
+# state what differs: the JSON format (disabled by default — public instances
+# get scraped otherwise; this container is never exposed beyond localhost/LAN)
+# and a secret key (CSRF token signing; a fixed placeholder is fine since this
+# instance is never internet-facing, unlike the searxng-docker upstream
+# default which sed-replaces it with a random value for public deployments).
+use_default_settings: true
+
+server:
+  secret_key: "hangarbaycc-local-searxng-not-internet-facing"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
