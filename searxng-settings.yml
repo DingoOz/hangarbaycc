@@ -15,8 +15,6 @@ server:
   secret_key: "hangarbaycc-local-searxng-not-internet-facing"
   limiter: false
   image_proxy: false
-  port: 8888
-  bind_address: "0.0.0.0"
 
 general:
   debug: false

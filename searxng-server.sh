@@ -80,6 +80,7 @@ docker run -d \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
   --network host \
+  -e SEARXNG_PORT=${PORT} \
   -v "${SETTINGS_FILE}:/etc/searxng/settings.yml:ro" \
   -e "SEARXNG_BASE_URL=${BASE_URL}" \
   "$IMAGE" >/dev/null
