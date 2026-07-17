@@ -41,6 +41,17 @@ if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   fi
   echo ">> $CONTAINER_NAME running but not responding — restarting..."
   docker restart "$CONTAINER_NAME" >/dev/null
+  echo ">> Waiting for $CONTAINER_NAME to become healthy..."
+  local tries=120
+  until curl -sf -m 3 "${BASE_URL}search?q=test&format=json" >/dev/null 2>&1; do
+    tries=$((tries - 1))
+    if [[ $tries -le 0 ]]; then
+      echo "!! $CONTAINER_NAME did not become healthy after restart." >&2
+      return 1
+    fi
+    sleep 0.5
+  done
+  echo ">> $CONTAINER_NAME is healthy after restart."
   exit 0
 fi
 

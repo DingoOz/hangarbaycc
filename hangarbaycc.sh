@@ -182,7 +182,7 @@ DISALLOWED_TOOLS=(Task Agent Workflow WebFetch WebSearch NotebookEdit)
 # — used for optional features (dictation) that should degrade, not abort.
 wait_for_http() {
   local url="$1" hint="${2:-}" mode="${3:-hard}" tries="${4:-60}"
-  until curl -sf "$url" >/dev/null 2>&1; do
+  until curl -sf -m 5 "$url" >/dev/null 2>&1; do
     tries=$((tries - 1))
     if [[ $tries -le 0 ]]; then
       echo "!! Timed out waiting for ${url} to answer." >&2

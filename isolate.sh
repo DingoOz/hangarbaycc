@@ -88,6 +88,9 @@ resolve_domain() {
 # --- Set up nftables rules ----------------------------------------------------
 
 setup_nftables() {
+  # Clean up any stale table from a previous failed run (prevents duplicate rules)
+  sudo nft delete table inet "$NFT_TABLE" 2>/dev/null || true
+
   # Create table and chain with policy ACCEPT (allow everything by default)
   sudo nft add table inet "$NFT_TABLE"
   sudo nft add chain inet "$NFT_TABLE" output \
