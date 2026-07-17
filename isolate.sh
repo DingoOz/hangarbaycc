@@ -106,6 +106,7 @@ setup_nftables() {
   sudo nft add set inet "$NFT_TABLE" blocked_ports '{ type inet_service; flags interval; }'
 
   # Add blocklist entries
+  FULL_BLOCK=0
   for entry in "${BLOCKLIST[@]}"; do
     case "$entry" in
       xai)
@@ -125,9 +126,9 @@ setup_nftables() {
         fi
         ;;
       any|loopback)
-        # Block everything except loopback
-        sudo nft add rule inet "$NFT_TABLE" output oif lo accept
-        sudo nft add rule inet "$NFT_TABLE" output ip daddr 127.0.0.0/8 accept
+        # Block everything except loopback (127.0.0.0/8)
+        sudo nft add rule inet "$NFT_TABLE" output ip daddr != 127.0.0.0/8 drop
+        FULL_BLOCK=1
         log "Blocking all external traffic (allow only loopback)"
         ;;
       *)
@@ -140,8 +141,11 @@ setup_nftables() {
     esac
   done
 
-  # Add the final drop rule for blocked destinations
-  sudo nft add rule inet "$NFT_TABLE" output ip daddr @blocked_ips drop
+  # Add the final drop rule for blocked destinations (skip for full-block mode
+  # since the catch-all rule above already blocks everything non-loopback)
+  if [[ "$FULL_BLOCK" -eq 0 ]]; then
+    sudo nft add rule inet "$NFT_TABLE" output ip daddr @blocked_ips drop
+  fi
 
   # Verify rules were applied
   local rule_count
