@@ -981,10 +981,12 @@ EOF
 
   echo ">> Launching Grok Build locally (model server left running afterward — stays warm)..."
   if [[ -n "$ISOLATE" ]]; then
-    # Network isolation: allow loopback (model server + SearXNG on 127.0.0.1),
-    # block everything else. Uses nftables cgroup matching.
-    echo ">> Network isolation enabled: loopback only, all other traffic blocked."
-    exec "$SCRIPT_DIR/isolate.sh" any -- grok -m "$GROK_MODEL_ID"
+    # Network isolation: block xAI's own domains only (DNS blackhole in a
+    # private mount namespace) so the harness can never phone home to xAI's
+    # cloud. Normal internet access, and loopback services (model server,
+    # SearXNG), are unaffected.
+    echo ">> Network isolation enabled: xAI domains blocked, all other traffic unaffected."
+    exec "$SCRIPT_DIR/isolate.sh" xai -- grok -m "$GROK_MODEL_ID"
   else
     exec grok -m "$GROK_MODEL_ID" --disable-web-search
   fi

@@ -1,21 +1,47 @@
 #!/usr/bin/env bash
 #
-# isolate.sh — network isolation wrapper for grok-local
+# isolate.sh — network isolation wrapper for the grok harness
 #
 # Usage:
 #   isolate.sh [blocklist ...] -- command [args...]
 #
-# Creates a network namespace with only loopback, then uses socat to
-# forward the specific ports the command needs (model server, SearXNG).
-# All other outbound traffic is impossible — the namespace has no
-# external network interface.
+# Two independent modes, chosen by the blocklist contents:
 #
-# Blocklist entries can be:
-#   api.x.ai            — specific domain/IP to block
-#   xai                 — shorthand for all xAI domains
-#   any / loopback      — block all external traffic (allow only loopback)
+#   any | loopback  — full lockdown. Runs the command in a network namespace
+#                      that has only loopback; socat forwards 127.0.0.1:<port>
+#                      inside the namespace to the host's 127.0.0.1:<port> so
+#                      local services (model server, SearXNG) stay reachable.
+#                      No other traffic — inbound or outbound — is possible.
 #
-# Requires: root (for network namespace creation + socat)
+#   <domain> | xai   — targeted blocklist (the default). The command keeps
+#                      the host's normal network namespace, so real internet
+#                      access and loopback services all work exactly as
+#                      normal. It runs under a private mount namespace with
+#                      two DNS-blocking layers laid over it:
+#                        1. A scoped dnsmasq instance (127.0.0.2:53) that
+#                           wildcard-resolves each blocklist domain AND ALL
+#                           ITS SUBDOMAINS to 127.0.0.1, forwarding everything
+#                           else upstream. This is the layer that matters —
+#                           clients call subdomains (cli-chat-proxy.grok.com,
+#                           api.x.ai, ...), not just the apex domain.
+#                        2. A bind-mounted /etc/hosts with known concrete
+#                           subdomains blackholed too, as an exact-match
+#                           fallback if dnsmasq isn't available.
+#                      "xai" expands to XAI_DOMAINS (dnsmasq layer) and
+#                      XAI_KNOWN_SUBDOMAINS (hosts layer) below. Only the
+#                      launched command's own view is affected — the host's
+#                      real /etc/hosts and /etc/resolv.conf are never touched.
+#
+#      Caveat: this is DNS-level blocking. It stops the harness resolving
+#      the blocked hostnames via the normal system resolver (what grok, curl,
+#      and virtually everything else use), but it does not inspect traffic,
+#      so a hardcoded IP literal or a DNS-over-HTTPS resolver embedded in the
+#      client would bypass it. Good enough to stop the harness talking to
+#      xAI's cloud by accident; not a substitute for a firewall if the
+#      threat model includes an adversarial binary.
+#
+# Requires: root (network/mount namespace creation); dnsmasq for the
+# wildcard layer (falls back to the weaker hosts-only layer if absent).
 #
 # Exit codes:
 #   0  — command exited successfully
@@ -27,7 +53,26 @@ set -euo pipefail
 log()  { echo ">> isolate.sh: $*"; }
 warn() { echo ">> isolate.sh: WARNING: $*" >&2; }
 
-# --- Parse arguments ----------------------------------------------------------
+# xAI's own domains — the harness must never be able to reach these, since
+# the whole point of hangarbaycc is running a *local* model behind the grok
+# CLI, not xAI's cloud. Only the two apex domains are needed: the DNS
+# wildcard layer below blocks every subdomain of each automatically (the
+# grok binary itself calls a bunch of them — cli-chat-proxy.grok.com,
+# assets.grok.com, computer-hub.grok.com, api.x.ai, accounts.x.ai,
+# auth.x.ai, console.x.ai, docs.x.ai — confirmed via `strings` on the
+# installed binary; an exact-match list would always be one subdomain
+# behind whatever xAI adds next).
+XAI_DOMAINS=(x.ai grok.com)
+
+# Concrete subdomains, for the /etc/hosts fallback layer only (used if
+# dnsmasq isn't available to do real wildcard blocking — see below).
+XAI_KNOWN_SUBDOMAINS=(
+  www.x.ai api.x.ai accounts.x.ai auth.x.ai console.x.ai docs.x.ai
+  www.grok.com cli-chat-proxy.grok.com assets.grok.com code.grok.com
+  computer-hub.grok.com app-builder-deployer.grok.com
+)
+
+# --- Parse arguments -----------------------------------------------------------
 
 BLOCKLIST=()
 COMMAND=()
@@ -46,7 +91,7 @@ for arg in "$@"; do
 done
 
 if [[ ${#BLOCKLIST[@]} -eq 0 ]]; then
-  BLOCKLIST=("api.x.ai")
+  BLOCKLIST=("xai")
 fi
 
 if [[ ${#COMMAND[@]} -eq 0 ]]; then
@@ -54,111 +99,248 @@ if [[ ${#COMMAND[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# --- Check prerequisites ------------------------------------------------------
+# DOMAINS: apex domains — wildcard-blocked via DNS (covers every subdomain).
+# HOSTS_DOMAINS: DOMAINS plus known concrete subdomains, blocked via a literal
+# /etc/hosts entry too, as a fallback layer in case dnsmasq isn't available.
+FULL_BLOCK=0
+DOMAINS=()
+HOSTS_DOMAINS=()
+for entry in "${BLOCKLIST[@]}"; do
+  case "$entry" in
+    any|loopback) FULL_BLOCK=1 ;;
+    xai)
+      DOMAINS+=("${XAI_DOMAINS[@]}")
+      HOSTS_DOMAINS+=("${XAI_DOMAINS[@]}" "${XAI_KNOWN_SUBDOMAINS[@]}")
+      ;;
+    *)
+      DOMAINS+=("$entry")
+      HOSTS_DOMAINS+=("$entry")
+      ;;
+  esac
+done
 
-check_prereqs() {
+ORIGINAL_UID="$(id -u)"
+ORIGINAL_GID="$(id -g)"
+ORIGINAL_USER="$(id -un)"
+ORIGINAL_HOME="$HOME"
+
+CLEANED_UP=0
+CMD_EXIT=0
+
+# --- Mode: any/loopback — full lockdown via network namespace ------------------
+
+run_full_block() {
   for cmd in socat ip; do
     if ! command -v "$cmd" &>/dev/null; then
       warn "'$cmd' not found — cannot set up network namespace isolation"
-      return 1
+      warn "Running command without network isolation"
+      CMD_EXIT=0
+      "${COMMAND[@]}" || CMD_EXIT=$?
+      exit "$CMD_EXIT"
     fi
   done
 
-  # Verify we can create a network namespace
   if ! sudo ip netns add "__hangarbaycc-test-$$" 2>/dev/null; then
     warn "Cannot create network namespace — need root privileges"
-    return 1
+    warn "Running command without network isolation"
+    CMD_EXIT=0
+    "${COMMAND[@]}" || CMD_EXIT=$?
+    exit "$CMD_EXIT"
   fi
   sudo ip netns delete "__hangarbaycc-test-$$" 2>/dev/null || true
-  return 0
-}
 
-# --- Main ---------------------------------------------------------------------
+  local netns="hangarbaycc-$$"
+  local ns_lo_up=0
+  local ns_socats=()
 
-NETNS="hangarbaycc-$$"
-NS_LO_UP=0
-NS_SOCATS=()
-CLEANED_UP=0
+  cleanup() {
+    if [[ $CLEANED_UP -eq 1 ]]; then return; fi
+    CLEANED_UP=1
+    log "Tearing down isolation..."
+    for pid in "${ns_socats[@]}"; do
+      sudo kill "$pid" 2>/dev/null || true
+    done
+    if [[ $ns_lo_up -eq 1 ]]; then
+      sudo ip netns exec "$netns" ip link set lo down 2>/dev/null || true
+    fi
+    sudo ip netns delete "$netns" 2>/dev/null || true
+    log "Isolation removed."
+  }
+  trap cleanup EXIT
 
-cleanup() {
-  if [[ $CLEANED_UP -eq 1 ]]; then return; fi
-  CLEANED_UP=1
-  log "Tearing down isolation..."
+  log "Setting up network namespace isolation..."
+  sudo ip netns add "$netns"
+  log "Created network namespace '$netns'"
 
-  # Kill socat forwarders
-  for pid in "${NS_SOCATS[@]}"; do
-    kill "$pid" 2>/dev/null || true
+  sudo ip netns exec "$netns" ip link set lo up
+  ns_lo_up=1
+  log "Loopback up in namespace"
+
+  # Local ports the isolated process needs to reach: 8080 (grok-local model
+  # server), 8888 (SearXNG), plus anything else already listening on the
+  # host's 127.0.0.1.
+  local needed_ports=(8080 8888)
+  while read -r local_addr; do
+    local port="${local_addr##*:}"
+    local found=0
+    for p in "${needed_ports[@]}"; do
+      [[ "$p" == "$port" ]] && found=1 && break
+    done
+    [[ $found -eq 0 ]] && needed_ports+=("$port")
+  done < <(ss -tlnH sport = 127.0.0.1:* 2>/dev/null | awk '{print $4}' | grep -v 'Local' || true)
+
+  for port in "${needed_ports[@]}"; do
+    sudo ip netns exec "$netns" socat \
+      TCP-LISTEN:${port},fork,reuseaddr,bind=127.0.0.1 \
+      TCP:127.0.0.1:${port} &
+    ns_socats+=($!)
+    log "Forwarding ns:127.0.0.1:${port} -> host:127.0.0.1:${port} (socat pid ${ns_socats[-1]})"
   done
 
-  # Bring down loopback in namespace
-  if [[ $NS_LO_UP -eq 1 ]]; then
-    sudo ip netns exec "$NETNS" ip link set lo down 2>/dev/null || true
+  log "Isolation active. Namespace '$netns' has only loopback."
+  log "Launching command in isolated namespace..."
+  sudo ip netns exec "$netns" env PATH="$PATH" HOME="$HOME" LANG="$LANG" "${COMMAND[@]}" || CMD_EXIT=$?
+  exit "$CMD_EXIT"
+}
+
+# --- Mode: domain blocklist — DNS wildcard block + hosts fallback --------------
+
+# Loopback alias dnsmasq listens on for the blocking resolver. Not the
+# systemd-resolved stub (127.0.0.53) or any other address anything else on
+# this host uses, so it can't collide with an already-bound port 53.
+DNSMASQ_ADDR="127.0.0.2"
+
+run_domain_block() {
+  for cmd in unshare setpriv; do
+    if ! command -v "$cmd" &>/dev/null; then
+      warn "'$cmd' not found — cannot set up domain blocking"
+      warn "Running command without network isolation"
+      "${COMMAND[@]}" || CMD_EXIT=$?
+      exit "$CMD_EXIT"
+    fi
+  done
+
+  if ! sudo true 2>/dev/null; then
+    warn "Cannot get root — need sudo privileges"
+    warn "Running command without network isolation"
+    "${COMMAND[@]}" || CMD_EXIT=$?
+    exit "$CMD_EXIT"
   fi
 
-  # Delete namespace
-  sudo ip netns delete "$NETNS" 2>/dev/null || true
+  # Layer 1 (fallback): literal /etc/hosts entries for known concrete
+  # subdomains. Only catches exact names — kept in case layer 2 can't start.
+  local hosts_file
+  hosts_file="$(mktemp /tmp/hangarbaycc-isolate-hosts.XXXXXX)"
+  cp /etc/hosts "$hosts_file"
+  {
+    echo ""
+    echo "# --- hangarbaycc isolate.sh: blocked for grok harness ---"
+    for d in "${HOSTS_DOMAINS[@]}"; do
+      echo "127.0.0.1 $d"
+    done
+  } >>"$hosts_file"
 
-  log "Isolation removed."
+  # Layer 2 (primary): a dnsmasq instance that wildcard-blocks every
+  # subdomain of each apex DOMAINS entry and forwards everything else to the
+  # host's real upstream resolver — this is what actually stops
+  # cli-chat-proxy.grok.com, assets.grok.com, and any future xAI subdomain
+  # that isn't in the static hosts list above.
+  local resolv_file dnsmasq_pid=""
+  resolv_file="$(mktemp /tmp/hangarbaycc-isolate-resolv.XXXXXX)"
+  cp /etc/resolv.conf "$resolv_file"
+
+  if command -v dnsmasq &>/dev/null; then
+    local upstream=()
+    while read -r ns; do upstream+=("--server=$ns"); done \
+      < <(awk '/^nameserver/{print $2}' /etc/resolv.conf)
+    [[ ${#upstream[@]} -eq 0 ]] && upstream=("--server=1.1.1.1")
+
+    local wildcard_args=()
+    for d in "${DOMAINS[@]}"; do
+      wildcard_args+=("--address=/${d}/127.0.0.1")
+    done
+
+    sudo dnsmasq --no-daemon --keep-in-foreground \
+      --listen-address="$DNSMASQ_ADDR" --port=53 --bind-interfaces \
+      --no-hosts --no-resolv "${upstream[@]}" "${wildcard_args[@]}" \
+      &>/tmp/hangarbaycc-isolate-dnsmasq.log &
+    dnsmasq_pid=$!
+
+    # Liveness (kill -0) is the portable check: dnsmasq exits immediately on
+    # a bind failure, so "still running" after a moment is a solid signal it
+    # bound :53 successfully. `dig`, if present, adds a real end-to-end query
+    # on top — but its absence shouldn't fail an otherwise-working setup.
+    sleep 0.3
+    local ready=0
+    if kill -0 "$dnsmasq_pid" 2>/dev/null; then
+      ready=1
+      if command -v dig &>/dev/null; then
+        ready=0
+        for _ in $(seq 1 20); do
+          if dig @"$DNSMASQ_ADDR" -p 53 +time=1 +tries=1 +short example.com &>/dev/null; then
+            ready=1
+            break
+          fi
+          kill -0 "$dnsmasq_pid" 2>/dev/null || break
+          sleep 0.2
+        done
+      fi
+    fi
+    if [[ $ready -eq 1 ]]; then
+      echo "nameserver $DNSMASQ_ADDR" >"$resolv_file"
+      log "Wildcard DNS block active for: ${DOMAINS[*]} (and all their subdomains)"
+    else
+      warn "dnsmasq didn't come up — falling back to the /etc/hosts layer only (see /tmp/hangarbaycc-isolate-dnsmasq.log)"
+      sudo kill "$dnsmasq_pid" 2>/dev/null || true
+      dnsmasq_pid=""
+    fi
+  else
+    warn "dnsmasq not found — falling back to the /etc/hosts layer only (won't catch unlisted subdomains)"
+  fi
+
+  local helper
+  helper="$(mktemp /tmp/hangarbaycc-isolate-run.XXXXXX)"
+  cat >"$helper" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+hosts_file="$1"; shift
+resolv_file="$1"; shift
+uid="$1"; shift
+gid="$1"; shift
+user="$1"; shift
+home="$1"; shift
+path="$1"; shift
+mount --bind "$hosts_file" /etc/hosts
+mount --bind "$resolv_file" /etc/resolv.conf
+exec setpriv --reuid "$uid" --regid "$gid" --init-groups --inh-caps=-all -- \
+  env PATH="$path" HOME="$home" USER="$user" LOGNAME="$user" "$@"
+HELPER
+  chmod +x "$helper"
+
+  cleanup() {
+    if [[ $CLEANED_UP -eq 1 ]]; then return; fi
+    CLEANED_UP=1
+    [[ -n "$dnsmasq_pid" ]] && sudo kill "$dnsmasq_pid" 2>/dev/null
+    rm -f "$hosts_file" "$resolv_file" "$helper" /tmp/hangarbaycc-isolate-dnsmasq.log
+  }
+  trap cleanup EXIT
+
+  log "Blocking: ${DOMAINS[*]}"
+  log "Everything else — internet, loopback services — passes through normally."
+  # sudo resets PATH/HOME/USER (secure_path, HOME=/root) — grok would then
+  # try to read config from a home directory this user can't access. Pass
+  # the caller's real values through explicitly rather than relying on sudo's.
+  sudo unshare --mount --propagation private -- \
+    "$helper" "$hosts_file" "$resolv_file" \
+    "$ORIGINAL_UID" "$ORIGINAL_GID" "$ORIGINAL_USER" "$ORIGINAL_HOME" "$PATH" \
+    "${COMMAND[@]}" || CMD_EXIT=$?
+  exit "$CMD_EXIT"
 }
-trap cleanup EXIT
 
-log "Setting up network namespace isolation..."
+# --- Main ------------------------------------------------------------------
 
-if ! check_prereqs; then
-  warn "Running command without network isolation"
-  exec "${COMMAND[@]}"
+if [[ $FULL_BLOCK -eq 1 ]]; then
+  run_full_block
+else
+  run_domain_block
 fi
-
-# Create network namespace
-sudo ip netns add "$NETNS"
-log "Created network namespace '$NETNS'"
-
-# Bring up loopback inside the namespace
-sudo ip netns exec "$NETNS" ip link set lo up
-NS_LO_UP=1
-log "Loopback up in namespace"
-
-# Determine which local ports the isolated process needs to reach.
-# The command connects to 127.0.0.1 in its own namespace, which only has lo.
-# We need socat to forward those ports to the HOST's 127.0.0.1.
-#
-# Default ports needed for hangarbaycc:
-#   8080 = grok-local model server (localhost on host)
-#   8888 = SearXNG (localhost on host)
-NEEDED_PORTS=(8080 8888)
-
-# Also check what's actually listening on 127.0.0.1
-while read -r local_addr; do
-  port="${local_addr##*:}"
-  # Add if not already in the list
-  local found=0
-  for p in "${NEEDED_PORTS[@]}"; do
-    [[ "$p" == "$port" ]] && found=1 && break
-  done
-  if [[ $found -eq 0 ]]; then
-    NEEDED_PORTS+=("$port")
-  fi
-done < <(ss -tlnH sport = 127.0.0.1:* 2>/dev/null | awk '{print $4}' | grep -v 'Local' || true)
-
-# Start socat forwarders: namespace-127.0.0.1:<port> -> host-127.0.0.1:<port>
-# We use the SAME port in the namespace as on the host. The namespace has its own
-# network stack, so port 8080 in the namespace does NOT conflict with port 8080
-# on the host — they are completely separate sockets.
-for port in "${NEEDED_PORTS[@]}"; do
-  sudo ip netns exec "$NETNS" socat \
-    TCP-LISTEN:${port},fork,reuseaddr,bind=127.0.0.1 \
-    TCP:127.0.0.1:${port} &
-  NS_SOCATS+=($!)
-  log "Forwarding ns:127.0.0.1:${port} -> host:127.0.0.1:${port} (socat pid ${NS_SOCATS[-1]})"
-done
-
-log "Isolation active. Namespace '$NETNS' has only loopback."
-log "All connections to 127.0.0.1 in the namespace are forwarded to the host."
-
-# --- Execute command in namespace ---------------------------------------------
-
-# The command runs inside the namespace. It only sees loopback.
-# All 127.0.0.1:<port> connections are forwarded to the host's 127.0.0.1:<port>.
-# The command uses the same ports as normal — no configuration needed.
-log "Launching command in isolated namespace..."
-exec sudo ip netns exec "$NETNS" env PATH="$PATH" HOME="$HOME" LANG="$LANG" "${COMMAND[@]}"

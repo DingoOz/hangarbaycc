@@ -419,31 +419,68 @@ that just installed Docker still can't use it — you'll need to log out/in
 
 ## Network isolation (--isolate)
 
-Backend 5 (Grok Build, local) now supports network isolation via
-`--isolate`. This wraps the `grok` process in a systemd user scope and
-applies nftables OUTPUT rules that block all outbound traffic except
-loopback (127.0.0.0/8) — keeping the local model server and SearXNG
-reachable while preventing any other network access.
+Backend 5 (Grok Build, local) supports network isolation via `--isolate`.
+The whole point of hangarbaycc is running a *local* model behind the `grok`
+CLI, so the harness must never be able to phone home to xAI's cloud —
+`--isolate` guarantees that by blocking xAI's own domains (`isolate.sh`'s
+`xai` blocklist), while leaving normal internet access and loopback services
+(model server, SearXNG) completely unaffected.
 
-**How it works:**
-1. Creates a transient systemd scope (`hangarbaycc-isolate-$$`)
-2. Adds nftables OUTPUT chain with `policy drop`
-3. Allows loopback traffic (`oif lo accept`)
-4. Matches the scope's cgroup via `socket cgroupv2` rules
-5. On exit, tears down nftables rules and scope automatically
+**How it works — two layers, both DNS-based, applied inside a private mount
+namespace so the host's real `/etc/hosts` and `/etc/resolv.conf` are never
+touched:**
+1. **Wildcard block (primary)** — starts a scoped `dnsmasq` instance
+   (`127.0.0.2:53`, killed on exit) that resolves `x.ai`, `grok.com`, and
+   *every subdomain of either* to `127.0.0.1`, forwarding everything else to
+   your normal upstream resolver. This is what actually matters: the `grok`
+   binary calls a handful of subdomains under the hood
+   (`cli-chat-proxy.grok.com`, `assets.grok.com`, `api.x.ai`, `accounts.x.ai`,
+   `console.x.ai`, `auth.x.ai`, ... — see `XAI_KNOWN_SUBDOMAINS` in
+   `isolate.sh`, extracted via `strings` on the installed binary), and a flat
+   list would always be one new subdomain behind whatever xAI adds next.
+2. **Hosts fallback (secondary)** — a copy of `/etc/hosts` with those same
+   known subdomains pointed at `127.0.0.1` too, bind-mounted over
+   `/etc/hosts` in the namespace. Only used if `dnsmasq` isn't installed or
+   fails to bind `:53` — exact-match only, so it doesn't catch subdomains
+   that aren't already in that list.
+3. Runs `grok` in the namespace with both bind-mounted, then drops back to
+   your normal user (`setpriv`) before exec, so file ownership/permissions
+   (`~/.grok/config.toml` etc.) are unaffected.
+4. On exit, `dnsmasq` is killed, the temp files are removed, and the mount
+   namespace disappears with the process.
+
+`isolate.sh` also has a stricter `any`/`loopback` mode (full lockdown via a
+network namespace with only loopback, socat-forwarded to the host's model
+server/SearXNG ports) for when you want to cut off *all* external traffic,
+not just xAI — not currently wired up to `--isolate`, but callable directly:
+`./isolate.sh any -- <command>`.
 
 **Requirements:**
-- **nftables** v1.0+ with `CONFIG_NFT_SOCKET` kernel module
-- **systemd** user manager running (usually automatic)
-- **root** (for nftables table/chain creation)
-- **Kernel ≥ 5.19** with cgroup v2 support (most modern distros)
+- **Linux** with cgroup v2 / a kernel new enough for mount namespaces
+  (anything from the last several years) — this does not work on macOS
+- **`unshare`** and **`setpriv`** (util-linux — present on effectively every
+  Linux distro by default)
+- **root** (for the mount namespace + bind mounts)
+- **`dnsmasq`** for the wildcard layer — not always preinstalled (`apt
+  install dnsmasq` / equivalent). If missing, isolation still runs, just on
+  the weaker exact-match hosts fallback only (a warning is printed)
+- **`dig`** is optional — used only to double-check the wildcard resolver
+  came up; its absence doesn't disable anything
 
 **Limitations:**
 - Only works for backend 5 (grok-local) — other backends already run on
   remote hosts where isolation is managed differently
-- Falls back to no isolation if any setup step fails (no hard error)
+- Falls back to no isolation at all if `unshare`/`setpriv` are missing or
+  `sudo` fails (no hard error — a warning, then runs unisolated)
+- DNS-level blocking: stops the harness resolving the blocked hostnames via
+  the normal system resolver, but doesn't inspect traffic — a hardcoded IP
+  literal, or a resolver that ignores `/etc/resolv.conf` and `/etc/hosts`
+  (e.g. DNS-over-HTTPS baked into the client), would bypass it. Checked
+  against the installed `grok` binary: it uses the standard glibc resolver
+  (`nsswitch.conf` here has no `resolve`/systemd-resolved entry to bypass),
+  so this holds for it today — worth re-checking after a `grok` update
 - The model server (`grok-local-server.sh`) is NOT isolated — it runs
-  as a detached child process outside the scope
+  as a detached child process outside the namespace
 
 **Usage:**
 ```bash
