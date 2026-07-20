@@ -148,7 +148,8 @@ echo "  2) meshllm             (LAN mesh-llm server, always-on, fixed config)"
 echo "  3) meshllm, no classifier   (same, but skips the auto-mode safety-classifier host — faster"
 echo "                              startup; Bash/Edit/Write auto-approval falls back to a normal"
 echo "                              interactive y/n prompt instead — see the classifier comment below)"
-echo "  4) Grok Build          (grok CLI instead of Claude Code; model runs on ml-server, fixed config)"
+echo "  4) Grok Build          (grok CLI instead of Claude Code; model runs on ml-server — pick"
+echo "                          Qwen3.6-35B-A3B or gemma4-31B-3gpu at the next prompt)"
 echo "  5) Grok Build (local)  (same, but model server runs on THIS machine only — no SSH/LAN)"
 read -rp "Backend [1-5]: " BACKEND_CHOICE
 MESHLLM_SKIP_CLASSIFIER=""
@@ -322,10 +323,15 @@ ensure_docker() {
 ensure_searxng() {
   WEBSEARCH_ENABLED=""
   local host port bind api_host label
+  # Port 8889, not SearXNG's usual 8888: ml-server already runs an unrelated,
+  # independently-managed SearXNG deployment on 8888 (loopback-only), and
+  # docker can't bind 0.0.0.0:8888 alongside an existing 127.0.0.1:8888 —
+  # 8889 keeps hangarbaycc's own container conflict-free instead of trying
+  # (and failing) to share the port.
   if [[ "$BACKEND" == "grok-local" ]]; then
-    host="" port=8888 bind="127.0.0.1" api_host="127.0.0.1" label="this machine"
+    host="" port=8889 bind="127.0.0.1" api_host="127.0.0.1" label="this machine"
   else
-    host="ml-server" port=8888 bind="0.0.0.0" api_host="192.168.1.16" label="ml-server"
+    host="ml-server" port=8889 bind="0.0.0.0" api_host="192.168.1.16" label="ml-server"
   fi
   local base_url="http://${api_host}:${port}/"
 
@@ -346,12 +352,12 @@ ensure_searxng() {
       echo "!! Could not copy searxng-server.sh to ${label} — continuing without web search." >&2
       return 0
     fi
-    if ! remote_exec "$host" "SEARXNG_BIND_ADDR=${bind} SEARXNG_BASE_URL=${base_url} bash ~/.hangarbaycc/searxng-server.sh"; then
+    if ! remote_exec "$host" "SEARXNG_PORT=${port} SEARXNG_BIND_ADDR=${bind} SEARXNG_BASE_URL=${base_url} bash ~/.hangarbaycc/searxng-server.sh"; then
       echo "!! Could not start SearXNG on ${label} — continuing without web search." >&2
       return 0
     fi
   else
-    if ! SEARXNG_BIND_ADDR="$bind" SEARXNG_BASE_URL="$base_url" "$SCRIPT_DIR/searxng-server.sh"; then
+    if ! SEARXNG_PORT="$port" SEARXNG_BIND_ADDR="$bind" SEARXNG_BASE_URL="$base_url" "$SCRIPT_DIR/searxng-server.sh"; then
       echo "!! Could not start SearXNG locally — continuing without web search." >&2
       return 0
     fi
@@ -822,9 +828,47 @@ if [[ "$BACKEND" == "grok" ]]; then
   GROK_PORT=8081
   GROK_BASE="http://${GROK_HOST_IP}:${GROK_PORT}"
   GROK_REMOTE_ROOT='$HOME/Programming/grok-local'   # single-quoted: expanded on the TARGET host
-  GROK_MODEL_ID="qwen36-mlserver"   # distinct from ml-server's own local-loopback config's "qwen36-local"
 
-  echo ">> Backend: Grok Build | Model: Qwen3.6-35B-A3B on ${GROK_SSH_HOST} (${GROK_BASE})"
+  # Two model stacks live on ml-server, both served by grok-local's llama-server
+  # on the SAME port (8081), so only one can be up at a time — the health check
+  # below therefore also verifies WHICH model is loaded and restarts on mismatch.
+  echo "Select grok model (ml-server):"
+  echo "  1) Qwen3.6-35B-A3B     (MoE, 2-GPU split: ml-server + rtx3070 — current default)"
+  echo "  2) gemma4-31B-3gpu     (dense 31B, RPC across 5060 Ti + rtx3070 + gtx1070 VM)"
+  read -rp "Model [1-2, default 1]: " GROK_MODEL_CHOICE
+  case "${GROK_MODEL_CHOICE:-1}" in
+    1)
+      GROK_MODEL_ID="qwen36-mlserver"   # distinct from ml-server's own local-loopback config's "qwen36-local"
+      GROK_MODEL_LABEL="Qwen3.6-35B-A3B"
+      GROK_MODEL_GGUF="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+      GROK_MODEL_MATCH="Qwen3.6-35B"
+      GROK_START_CMD="./bin/run-qwen36-35b.sh --port ${GROK_PORT}"
+      GROK_DOWNLOAD_HINT="${GROK_REMOTE_ROOT}/bin/download-qwen36.sh"
+      GROK_CTX_WINDOW=131072
+      # Qwen's own stack tears down cleanly with a port kill; nothing else to stop.
+      GROK_STOP_CMD="fuser -k ${GROK_PORT}/tcp 2>/dev/null || true"
+      GROK_WAIT_TRIES=60
+      ;;
+    2)
+      GROK_MODEL_ID="gemma4-31b-mlserver"
+      GROK_MODEL_LABEL="gemma4-31B (3-GPU)"
+      GROK_MODEL_GGUF="gemma-4-31B-it-UD-Q4_K_XL.gguf"
+      GROK_MODEL_MATCH="gemma-4-31B"
+      GROK_START_CMD="./bin/start-gemma4-31b-3gpu.sh --port ${GROK_PORT}"
+      GROK_DOWNLOAD_HINT="hf download unsloth/gemma-4-31B-it-GGUF ${GROK_MODEL_GGUF} --local-dir ${GROK_REMOTE_ROOT}/models"
+      # The gemma script's own default (-c 65536). Only 10 of its 60 layers are
+      # global-attention; the other 50 are sliding-window (fixed ~425 MiB KV),
+      # so context costs just ~1.36 GiB per 32K across the three GPUs.
+      GROK_CTX_WINDOW=65536
+      # Its --stop also shuts down both RPC workers (3070 + 1070 VM).
+      GROK_STOP_CMD="cd ${GROK_REMOTE_ROOT} && ./bin/start-gemma4-31b-3gpu.sh --stop 2>/dev/null || true; fuser -k ${GROK_PORT}/tcp 2>/dev/null || true"
+      # Slower: brings up the gtx1070 VM and two RPC peers before loading ~19 GB.
+      GROK_WAIT_TRIES=900
+      ;;
+    *) echo "!! Invalid model choice: $GROK_MODEL_CHOICE" >&2; exit 1 ;;
+  esac
+
+  echo ">> Backend: Grok Build | Model: ${GROK_MODEL_LABEL} on ${GROK_SSH_HOST} (${GROK_BASE})"
 
   if ! ssh -o ConnectTimeout=5 "$GROK_SSH_HOST" true; then
     echo "!! Could not reach '$GROK_SSH_HOST' over SSH." >&2
@@ -836,28 +880,48 @@ if [[ "$BACKEND" == "grok" ]]; then
     exit 1
   fi
 
+  # A healthy server on :8081 may be serving the OTHER model (they share the
+  # port), so match the loaded model path from /props before reusing it.
+  GROK_REUSE=0
   if curl -sf -m 3 "${GROK_BASE}/health" >/dev/null 2>&1; then
-    echo ">> Model server already up on ${GROK_SSH_HOST}:${GROK_PORT} — reusing it."
-  else
-    echo ">> Model server not up — starting it on ${GROK_SSH_HOST}..."
-    if ! remote_exec "$GROK_SSH_HOST" "test -f ${GROK_REMOTE_ROOT}/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"; then
-      echo "!! Model gguf not found in ${GROK_REMOTE_ROOT}/models on ${GROK_SSH_HOST}." >&2
-      echo "!! Download it there first: ${GROK_REMOTE_ROOT}/bin/download-qwen36.sh" >&2
+    GROK_LOADED="$(curl -sf -m 5 "${GROK_BASE}/props" 2>/dev/null || true)"
+    if [[ "$GROK_LOADED" == *"$GROK_MODEL_MATCH"* ]]; then
+      GROK_REUSE=1
+      echo ">> Model server already up on ${GROK_SSH_HOST}:${GROK_PORT} with ${GROK_MODEL_LABEL} — reusing it."
+    else
+      echo ">> A different model is loaded on ${GROK_SSH_HOST}:${GROK_PORT} — stopping it to load ${GROK_MODEL_LABEL}."
+      # Stop BOTH stacks: whichever is up, its own teardown is the clean one
+      # (the gemma stack also owns two RPC workers that must be released).
+      remote_script "$GROK_SSH_HOST" <<EOF
+cd ${GROK_REMOTE_ROOT} 2>/dev/null || exit 0
+./bin/start-gemma4-31b-3gpu.sh --stop >/dev/null 2>&1 || true
+fuser -k ${GROK_PORT}/tcp 2>/dev/null || true
+EOF
+      sleep 2
+    fi
+  fi
+
+  if [[ "$GROK_REUSE" -eq 0 ]]; then
+    echo ">> Model server not up — starting ${GROK_MODEL_LABEL} on ${GROK_SSH_HOST}..."
+    if ! remote_exec "$GROK_SSH_HOST" "test -f ${GROK_REMOTE_ROOT}/models/${GROK_MODEL_GGUF}"; then
+      echo "!! Model gguf ${GROK_MODEL_GGUF} not found in ${GROK_REMOTE_ROOT}/models on ${GROK_SSH_HOST}." >&2
+      echo "!! Get it there first: ${GROK_DOWNLOAD_HINT}" >&2
       exit 1
     fi
     # Port may be occupied by a stale/unhealthy process from a prior crashed
     # run (the health check above already ruled out a *healthy* server) —
     # clear it before starting, same posture as the Ollama backend's stop step.
     remote_script "$GROK_SSH_HOST" <<EOF
-fuser -k ${GROK_PORT}/tcp 2>/dev/null || true
+${GROK_STOP_CMD}
 sleep 1
 cd ${GROK_REMOTE_ROOT}
 mkdir -p models
-setsid nohup ./bin/run-qwen36-35b.sh --port ${GROK_PORT} >models/llama-server.log 2>&1 </dev/null &
+setsid nohup ${GROK_START_CMD} >models/llama-server.log 2>&1 </dev/null &
 disown
 EOF
     wait_for_http "${GROK_BASE}/health" \
-      "Check ${GROK_REMOTE_ROOT}/models/llama-server.log on ${GROK_SSH_HOST}."
+      "Check ${GROK_REMOTE_ROOT}/models/llama-server.log on ${GROK_SSH_HOST}." \
+      hard "$GROK_WAIT_TRIES"
     echo ">> Model server ready on ${GROK_SSH_HOST}:${GROK_PORT}."
   fi
 
@@ -875,16 +939,16 @@ EOF
     cat >>"$GROK_CONFIG" <<EOF
 
 [model.${GROK_MODEL_ID}]
-model = "qwen36-mlserver"
+model = "${GROK_MODEL_ID}"
 base_url = "${GROK_BASE}/v1"
-name = "Qwen3.6-35B-A3B (ml-server, LAN)"
+name = "${GROK_MODEL_LABEL} (ml-server, LAN)"
 description = "grok-local's llama-server on ml-server, reached over the LAN"
 api_key = "local"
 api_backend = "chat_completions"
 temperature = 0.7
 top_p = 0.95
-max_completion_tokens = 8192
-context_window = 131072
+max_completion_tokens = 32768
+context_window = ${GROK_CTX_WINDOW}
 stream_tool_calls = false
 EOF
   fi
@@ -979,7 +1043,7 @@ api_key = "local"
 api_backend = "chat_completions"
 temperature = 0.7
 top_p = 0.95
-max_completion_tokens = 8192
+max_completion_tokens = 32768
 context_window = ${GROK_CTX}
 stream_tool_calls = false
 EOF

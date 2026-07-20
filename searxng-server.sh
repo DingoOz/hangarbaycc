@@ -29,12 +29,30 @@ if [[ "${DOCKER_SG:-}" == "1" ]]; then
   docker() { sg docker -c "docker $*"; }
 fi
 
-PORT="${SEARXNG_PORT:-8888}"
+PORT="${SEARXNG_PORT:-8889}"
 BIND_ADDR="${SEARXNG_BIND_ADDR:-127.0.0.1}"
 BASE_URL="${SEARXNG_BASE_URL:-http://${BIND_ADDR}:${PORT}/}"
 CONTAINER_NAME="${SEARXNG_CONTAINER_NAME:-hangarbaycc-searxng}"
 IMAGE="${SEARXNG_IMAGE:-docker.io/searxng/searxng:latest}"
 SETTINGS_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/searxng-settings.yml"
+
+# Something other than our own container may already be bound to this port
+# (e.g. an unrelated, independently-managed SearXNG deployment on the host).
+# If it already answers JSON search queries AT THE ADDRESS WE'LL ACTUALLY BE
+# TOLD TO USE (BASE_URL — 127.0.0.1 for the local grok-local backend, the
+# host's LAN IP for everyone else via ml-server), reuse it rather than
+# fighting it for the port — `docker run -p` would just fail with "port is
+# already allocated" otherwise, and there's no need for a second instance.
+# Deliberately NOT hardcoded to 127.0.0.1: a pre-existing SearXNG bound only
+# to loopback would match that check (this script often runs on the target
+# host itself, over SSH) yet be unreachable to LAN callers, causing the
+# caller's wait_for_http to silently poll the real BASE_URL for up to two
+# minutes with no output — indistinguishable from a hang.
+if curl -fsS --max-time 3 "${BASE_URL%/}/search?q=test&format=json" \
+    2>/dev/null | grep -q '"query"'; then
+  echo ">> Something is already serving JSON-capable SearXNG at ${BASE_URL} — reusing it."
+  exit 0
+fi
 
 if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   # Container is running — verify SearXNG is actually responding

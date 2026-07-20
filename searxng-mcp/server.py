@@ -27,7 +27,7 @@ from mcp.server.fastmcp import FastMCP
 # ensure_searxng() in hangarbaycc.sh passes the URL as argv[1] there. Claude
 # Code's --mcp-config JSON does support `env`, which is used instead for that
 # path — either way this script accepts both.
-SEARXNG_URL = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888")).rstrip("/")
+SEARXNG_URL = (sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SEARXNG_URL", "http://127.0.0.1:8889")).rstrip("/")
 TIMEOUT = float(os.environ.get("SEARXNG_MCP_TIMEOUT", "15"))
 
 mcp = FastMCP("searxng")
