@@ -129,6 +129,14 @@ diagnoses a bad session from the logs.
 auto-detected from a `meshllm/` model prefix):
 `bench/run-bench.sh "meshllm/Qwen3-30B-A3B-Q4_K_M-layers" 192.168.1.16:9337`.
 
+For raw throughput/latency against backend 5's `llama-server` specifically
+(not correctness), use `bench/bench-local.py [PORT] [-n RUNS] [PROMPT]`. It
+reports true server TTFT (first byte of either `reasoning_content` or
+`content`) separately from reasoning duration, since Qwen3.6-35B-A3B is a
+reasoning model that can spend thousands of tokens in `reasoning_content`
+before ever emitting `content` — a naive `content`-only TTFT check reports
+that thinking time as latency.
+
 ## Aider and the meshllm backend
 
 `launch-aider.sh` can drive [Aider](https://aider.chat) against either a
@@ -335,15 +343,38 @@ over the LAN. The first run adds a `[model.qwen36-mlserver]` entry to
 
 The model server is `grok-local-server.sh`, vendored into this repo (so
 `hangarbaycc.sh` has no external script reference) from
-`~/ai-models/qwen3.6-35b-a3b/run.sh` — `llama-server` fixed at `:8080`, 200K
-context, `q8_0` KV, tuned for a 16 GB GPU. No SSH, no LAN dependency —
-everything stays on this box. The model weights and the `llama-server`
-binary itself still live outside the repo (too large to vendor); both paths
-are overridable via `GROK_LOCAL_MODEL_DIR` and `GROK_LOCAL_LLAMA_SERVER` if
-yours differ from the defaults (`~/ai-models/qwen3.6-35b-a3b` and
+`~/ai-models/qwen3.6-35b-a3b/run.sh` — `llama-server` fixed at `:8080`, 110K
+context (client-side `context_window` is set to 100K so `grok` compacts
+before the model's own long-context quality collapses, observed starting
+around ~90K), `q8_0` KV, DRY sampling and a 4K reasoning-token budget (both
+targeting the long-context repetition-looping failure mode), tuned for a
+16 GB GPU. No SSH, no LAN dependency — everything stays on this box. The
+model weights and the `llama-server` binary itself still live outside the
+repo (too large to vendor); both paths are overridable via
+`GROK_LOCAL_MODEL_DIR` and `GROK_LOCAL_LLAMA_SERVER` if yours differ from the
+defaults (`~/ai-models/qwen3.6-35b-a3b` and
 `~/llama.cpp/build/bin/llama-server`). The first run adds a
 `[model.qwen36-local]` entry to `~/.grok/config.toml` pointing at
 `http://127.0.0.1:8080/v1`.
+
+On a cold start (nothing already listening on `:8080`) you're asked two
+questions before the server backgrounds itself:
+- **Image/vision support (mmproj)** — off by default; Grok Build is a
+  text-only coding CLI in practice, and loading mmproj costs load time/RAM
+  for a capability that's rarely used. Answer `y` if you'll actually send
+  images through it.
+- **Auto-unload after N minutes** — `-1` or `0` (default, just hit enter)
+  keeps it running indefinitely, matching the old behavior; any other number
+  stops the server after that many minutes so the VRAM isn't held
+  indefinitely. Both answers can be preset non-interactively via
+  `GROK_LOCAL_IMAGES=1|0` / `GROK_LOCAL_TIMEOUT=<minutes>`, which also
+  skips the prompt entirely (needed for the actual backgrounded launch,
+  since its stdin is `/dev/null` and can't prompt itself — `hangarbaycc.sh`
+  asks on its behalf, while it still has a real terminal).
+
+To free the VRAM immediately rather than waiting out the timer (or if you
+set `-1`), run `./grok-local-unload.sh` (optionally with a port argument) —
+it's a no-op if nothing's running.
 
 **Requires:** the weights present at `GROK_LOCAL_MODEL_DIR` (or the default
 above) and a built `llama-server` at `GROK_LOCAL_LLAMA_SERVER`.

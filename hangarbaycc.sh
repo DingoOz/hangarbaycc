@@ -907,7 +907,8 @@ if [[ "$BACKEND" == "grok-local" ]]; then
   GROK_SERVER_SCRIPT="$SCRIPT_DIR/grok-local-server.sh"
   GROK_MODEL_DIR="${GROK_LOCAL_MODEL_DIR:-$HOME/ai-models/qwen3.6-35b-a3b}"
   GROK_MODEL_ID="qwen36-local"   # distinct from ml-server's "qwen36-mlserver"
-  GROK_CTX=200000   # matches grok-local-server.sh's -c flag
+  GROK_CTX=100000   # 10k under grok-local-server.sh's -c: the model loops past
+                    # ~90k context, so the client must compact before then
 
   echo ">> Backend: Grok Build (local) | Model: Qwen3.6-35B-A3B on this machine (${GROK_BASE})"
 
@@ -935,7 +936,21 @@ if [[ "$BACKEND" == "grok-local" ]]; then
     # clear it before starting, same posture as the Ollama backend's stop step.
     fuser -k "${GROK_PORT}/tcp" 2>/dev/null || true
     sleep 1
-    GROK_LOCAL_MODEL_DIR="$GROK_MODEL_DIR" setsid nohup "$GROK_SERVER_SCRIPT" \
+    # grok-local-server.sh backgrounds with stdin on /dev/null (so it survives
+    # this terminal closing), which means IT can never prompt interactively —
+    # ask here instead, while we still have a real tty, and pass the answer
+    # through as an env var.
+    if [[ -z "${GROK_LOCAL_IMAGES:-}" && -t 0 ]]; then
+      read -r -p "Load image/vision support (mmproj)? Rarely needed for coding, adds load time/RAM [y/N] " reply
+      [[ "$reply" =~ ^[Yy]$ ]] && GROK_LOCAL_IMAGES=1 || GROK_LOCAL_IMAGES=0
+    fi
+    if [[ -z "${GROK_LOCAL_TIMEOUT:-}" && -t 0 ]]; then
+      read -r -p "Auto-unload server after how many minutes? (-1 or 0 = never) [-1]: " reply
+      GROK_LOCAL_TIMEOUT="${reply:--1}"
+    fi
+    GROK_LOCAL_MODEL_DIR="$GROK_MODEL_DIR" GROK_LOCAL_IMAGES="${GROK_LOCAL_IMAGES:-0}" \
+      GROK_LOCAL_TIMEOUT="${GROK_LOCAL_TIMEOUT:--1}" \
+      setsid nohup "$GROK_SERVER_SCRIPT" \
       >/tmp/hangarbaycc-grok-local.log 2>&1 </dev/null &
     disown
     wait_for_http "${GROK_BASE}/health" "Check /tmp/hangarbaycc-grok-local.log."
