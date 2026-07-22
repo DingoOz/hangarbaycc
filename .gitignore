@@ -3,3 +3,4 @@ __pycache__/
 bench/results/
 searxng-mcp/.venv/
 .grok/
+qt_hello/build/

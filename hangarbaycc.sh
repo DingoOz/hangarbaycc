@@ -88,7 +88,9 @@
 #   4) Grok Build (ml-server)  model server is grok-local's own stack, fixed
 #      at :8081, 128K ctx, q8_0 KV, started/reused over SSH on ml-server (see
 #      ~/Programming/grok-local/README.md there). `grok` itself always runs
-#      HERE, talking to ml-server over the LAN.
+#      HERE, talking to ml-server over the LAN. The default sub-choice instead
+#      ATTACHES to whatever llama-server is already up on :8081 — no SSH, no
+#      start/stop; the model id and context window are read from /props.
 #   5) Grok Build (local)      model server is grok-local-server.sh (vendored
 #      into this repo from ~/ai-models/qwen3.6-35b-a3b/run.sh so there's no
 #      external script reference), fixed at :8080, 200K ctx, q8_0 KV, on THIS
@@ -149,7 +151,8 @@ echo "  3) meshllm, no classifier   (same, but skips the auto-mode safety-classi
 echo "                              startup; Bash/Edit/Write auto-approval falls back to a normal"
 echo "                              interactive y/n prompt instead — see the classifier comment below)"
 echo "  4) Grok Build          (grok CLI instead of Claude Code; model runs on ml-server — pick"
-echo "                          Qwen3.6-35B-A3B or gemma4-31B-3gpu at the next prompt)"
+echo "                          the already-running server, Qwen3.6-35B-A3B or gemma4-31B-3gpu at the"
+echo "                          next prompt)"
 echo "  5) Grok Build (local)  (same, but model server runs on THIS machine only — no SSH/LAN)"
 read -rp "Backend [1-5]: " BACKEND_CHOICE
 MESHLLM_SKIP_CLASSIFIER=""
@@ -833,11 +836,17 @@ if [[ "$BACKEND" == "grok" ]]; then
   # on the SAME port (8081), so only one can be up at a time — the health check
   # below therefore also verifies WHICH model is loaded and restarts on mismatch.
   echo "Select grok model (ml-server):"
-  echo "  1) Qwen3.6-35B-A3B     (MoE, 2-GPU split: ml-server + rtx3070 — current default)"
-  echo "  2) gemma4-31B-3gpu     (dense 31B, RPC across 5060 Ti + rtx3070 + gtx1070 VM)"
-  read -rp "Model [1-2, default 1]: " GROK_MODEL_CHOICE
+  echo "  1) Use existing server  (whatever llama-server is already up on ${GROK_SSH_HOST}:${GROK_PORT} — default)"
+  echo "  2) Qwen3.6-35B-A3B     (MoE, 2-GPU split: ml-server + rtx3070)"
+  echo "  3) gemma4-31B-3gpu     (dense 31B, RPC across 5060 Ti + rtx3070 + gtx1070 VM)"
+  read -rp "Model [1-3, default 1]: " GROK_MODEL_CHOICE
+  # Attach to what's running (option 1) vs. own the server's lifecycle (2/3).
+  GROK_USE_EXISTING=0
   case "${GROK_MODEL_CHOICE:-1}" in
     1)
+      GROK_USE_EXISTING=1
+      ;;
+    2)
       GROK_MODEL_ID="qwen36-mlserver"   # distinct from ml-server's own local-loopback config's "qwen36-local"
       GROK_MODEL_LABEL="Qwen3.6-35B-A3B"
       GROK_MODEL_GGUF="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
@@ -849,7 +858,7 @@ if [[ "$BACKEND" == "grok" ]]; then
       GROK_STOP_CMD="fuser -k ${GROK_PORT}/tcp 2>/dev/null || true"
       GROK_WAIT_TRIES=60
       ;;
-    2)
+    3)
       GROK_MODEL_ID="gemma4-31b-mlserver"
       GROK_MODEL_LABEL="gemma4-31B (3-GPU)"
       GROK_MODEL_GGUF="gemma-4-31B-it-UD-Q4_K_XL.gguf"
@@ -868,6 +877,40 @@ if [[ "$BACKEND" == "grok" ]]; then
     *) echo "!! Invalid model choice: $GROK_MODEL_CHOICE" >&2; exit 1 ;;
   esac
 
+  # Attach mode: no SSH, no GPU check, no start/stop — whatever is already
+  # listening on :8081 is taken as-is. Its identity and real context window
+  # come from /props, so grok's config matches the server instead of guessing.
+  if [[ "$GROK_USE_EXISTING" -eq 1 ]]; then
+    if ! curl -sf -m 3 "${GROK_BASE}/health" >/dev/null 2>&1; then
+      echo "!! No healthy llama-server on ${GROK_BASE}." >&2
+      echo "!! Nothing to attach to — re-run and pick option 2 or 3 to start one." >&2
+      exit 1
+    fi
+    GROK_PROPS="$(curl -sf -m 5 "${GROK_BASE}/props" 2>/dev/null || true)"
+    GROK_PROPS_INFO="$(printf '%s' "$GROK_PROPS" | python3 -c '
+import json, os, sys
+try:
+    p = json.load(sys.stdin)
+except Exception:
+    p = {}
+path = p.get("model_path") or p.get("default_generation_settings", {}).get("model") or ""
+ctx = p.get("default_generation_settings", {}).get("n_ctx") or p.get("n_ctx") or 0
+print(os.path.basename(path))
+print(int(ctx))
+' 2>/dev/null || true)"
+    GROK_MODEL_GGUF="$(printf '%s\n' "$GROK_PROPS_INFO" | sed -n 1p)"
+    GROK_CTX_WINDOW="$(printf '%s\n' "$GROK_PROPS_INFO" | sed -n 2p)"
+    [[ -n "$GROK_MODEL_GGUF" ]] || GROK_MODEL_GGUF="unknown"
+    [[ "${GROK_CTX_WINDOW:-0}" -gt 0 ]] 2>/dev/null || GROK_CTX_WINDOW=32768
+    GROK_MODEL_LABEL="${GROK_MODEL_GGUF%.gguf} (already running)"
+    # One config entry per distinct running model, so a stale context_window
+    # from a previous attach doesn't get reused for a different model.
+    GROK_MODEL_ID="existing-$(printf '%s' "${GROK_MODEL_GGUF%.gguf}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')"
+    echo ">> Backend: Grok Build | Attaching to running server on ${GROK_SSH_HOST} (${GROK_BASE})"
+    echo ">> Loaded model: ${GROK_MODEL_GGUF} | context window: ${GROK_CTX_WINDOW}"
+  fi
+
+  if [[ "$GROK_USE_EXISTING" -eq 0 ]]; then
   echo ">> Backend: Grok Build | Model: ${GROK_MODEL_LABEL} on ${GROK_SSH_HOST} (${GROK_BASE})"
 
   if ! ssh -o ConnectTimeout=5 "$GROK_SSH_HOST" true; then
@@ -924,6 +967,7 @@ EOF
       hard "$GROK_WAIT_TRIES"
     echo ">> Model server ready on ${GROK_SSH_HOST}:${GROK_PORT}."
   fi
+  fi   # GROK_USE_EXISTING == 0
 
   # Client-side: register the model with grok's config if it isn't there yet.
   # Only [model.*] sections in ~/.grok/config.toml are read (project-scoped
@@ -933,7 +977,20 @@ EOF
   mkdir -p "$(dirname "$GROK_CONFIG")"
   touch "$GROK_CONFIG"
   if grep -q "^\[model\.${GROK_MODEL_ID}\]" "$GROK_CONFIG" 2>/dev/null; then
-    echo ">> Model '$GROK_MODEL_ID' already configured in $GROK_CONFIG."
+    if [[ "$GROK_USE_EXISTING" -eq 1 ]]; then
+      # Attach mode: the section already exists (same model attached before),
+      # but the server may have been reloaded since with a different -c —
+      # refresh context_window in place so it never goes stale.
+      echo ">> Model '$GROK_MODEL_ID' already configured in $GROK_CONFIG — refreshing context_window to ${GROK_CTX_WINDOW}."
+      awk -v section="[model.${GROK_MODEL_ID}]" -v ctx="$GROK_CTX_WINDOW" '
+        $0 == section { in_section=1 }
+        in_section && /^\[/ && $0 != section { in_section=0 }
+        in_section && /^context_window[[:space:]]*=/ { print "context_window = " ctx; next }
+        { print }
+      ' "$GROK_CONFIG" >"${GROK_CONFIG}.tmp" && mv "${GROK_CONFIG}.tmp" "$GROK_CONFIG"
+    else
+      echo ">> Model '$GROK_MODEL_ID' already configured in $GROK_CONFIG."
+    fi
   else
     echo ">> Adding model '$GROK_MODEL_ID' to $GROK_CONFIG (points at ${GROK_BASE})..."
     cat >>"$GROK_CONFIG" <<EOF
